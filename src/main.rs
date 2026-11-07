@@ -14,9 +14,11 @@ mod storage;
 mod store;
 mod textstyle;
 
-use std::io::Write as _;
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write as _};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context as _};
 use futures::{channel::oneshot, future};
@@ -29,7 +31,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 
-use crate::store::{e164, open_store, Accounts};
+use crate::store::{e164, open_store, private_dir, Accounts};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The signal-cli version whose interface is implemented. Corvus gates features on the last word of
@@ -90,7 +92,77 @@ fn option(rest: &[String], short: &str, long: &str) -> Option<String> {
     None
 }
 
-fn init_logging(verbosity: u8) {
+/// Writes diagnostics to stderr (shown briefly by Corvus) and to a private, persistent log file.
+#[derive(Clone)]
+struct LogWriter {
+    file: Option<Arc<Mutex<File>>>,
+}
+
+struct LogWriterGuard {
+    file: Option<Arc<Mutex<File>>>,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
+    type Writer = LogWriterGuard;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriterGuard { file: self.file.clone() }
+    }
+}
+
+impl io::Write for LogWriterGuard {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(file) = &self.file {
+            if let Ok(mut file) = file.lock() {
+                let _ = file.write_all(buf);
+            }
+        }
+        // stderr is consumed by the desktop UI; keep it working even if the log file is unavailable.
+        let _ = io::stderr().lock().write_all(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(file) = &self.file {
+            if let Ok(mut file) = file.lock() {
+                let _ = file.flush();
+            }
+        }
+        let _ = io::stderr().lock().flush();
+        Ok(())
+    }
+}
+
+fn open_diagnostic_log(config: Option<&Path>) -> Option<File> {
+    let dir = store::data_dir(config);
+    private_dir(&dir).ok()?;
+    let path = dir.join("corvus-signal.log");
+
+    // Keep one bounded backup so a long-running daemon cannot grow the log indefinitely.
+    const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+    if fs::metadata(&path).is_ok_and(|meta| meta.len() >= MAX_LOG_BYTES) {
+        let backup = dir.join("corvus-signal.log.1");
+        let _ = fs::remove_file(&backup);
+        let _ = fs::rename(&path, &backup);
+    }
+
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Some(file)
+}
+
+fn init_logging(verbosity: u8, config: Option<&Path>) {
     // stderr is shown to the user by corvus, so only problems are logged by default.
     let default = match verbosity {
         0 => "corvus_signal=warn,presage=error,libsignal_service=error",
@@ -99,7 +171,8 @@ fn init_logging(verbosity: u8) {
     };
     let filter = tracing_subscriber::EnvFilter::try_from_env("CORVUS_SIGNAL_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
-    tracing_subscriber::fmt().with_writer(std::io::stderr).with_env_filter(filter).with_target(false).init();
+    let writer = LogWriter { file: open_diagnostic_log(config).map(|file| Arc::new(Mutex::new(file))) };
+    tracing_subscriber::fmt().with_writer(writer).with_env_filter(filter).with_target(false).init();
 }
 
 fn main() -> ExitCode {
@@ -110,7 +183,7 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    init_logging(args.verbosity);
+    init_logging(args.verbosity, args.config.as_deref());
     if args.version {
         println!("corvus-signal {VERSION} compatible with signal-cli {COMPAT_VERSION}");
         return ExitCode::SUCCESS;
