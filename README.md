@@ -1,4 +1,4 @@
-# corvus-signal
+# corvus-cli
 
 A Signal backend for Corvus written in Rust on [presage](https://github.com/whisperfish/presage),
 in place of the Java signal-cli. It runs the same command lines Corvus gives signal-cli
