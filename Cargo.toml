@@ -15,8 +15,8 @@ path = "src/main.rs"
 # The corvus integration branch of presage (it uses the one of libsignal-service-rs): upstream plus
 # the open pull requests corvus needs and corvus' own additions, see README.md.
 # cdsi: contact discovery, to find a phone number nobody synced (libsignal-net, BoringSSL)
-presage = { git = "https://github.com/ada-h00k/presage", rev = "16e33907d4dd9d0d3175c7838b4e00d2c49672e0", features = ["cdsi"] }
-presage-store-sqlite = { git = "https://github.com/ada-h00k/presage", rev = "16e33907d4dd9d0d3175c7838b4e00d2c49672e0", features = ["cdsi"] }
+presage = { git = "https://github.com/ada-h00k/presage", rev = "4b81740610c301cbd54d95f4dbd4cadd692af95e", features = ["cdsi"] }
+presage-store-sqlite = { git = "https://github.com/ada-h00k/presage", rev = "4b81740610c301cbd54d95f4dbd4cadd692af95e", features = ["cdsi"] }
 
 anyhow = "1.0"
 base64 = "0.22"
@@ -35,12 +35,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Same patches as the presage workspace; [patch] does not propagate from dependencies.
 [patch.crates-io]
-libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
+libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "858ae0a83b7d623563723d58d38c8c4e9298e466" }
 
 # Signal Server now requires the encrypted upload length when requesting a CDN upload form.
 # Keep the Corvus-specific presage integration while using the fixed service implementation.
 [patch."https://github.com/cyberneticangel/libsignal-service-rs"]
-libsignal-service = { git = "https://github.com/ada-h00k/libsignal-service-rs", rev = "ac4671b41fec9f381d24fc60f7c721e01650cf48" }
+libsignal-service = { git = "https://github.com/ada-h00k/libsignal-service-rs", rev = "7a7526741dfd9ad4c4894717f22651eb0506fb7e" }
 
 # unoptimized ML-KEM can stack-overflow when decrypting PQXDH prekey messages
 [profile.dev.package.libcrux-ml-kem]
