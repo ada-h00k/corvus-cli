@@ -2,6 +2,7 @@
 // updateProfile and updateAccount (username).
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use base64::prelude::*;
 use presage::libsignal_service::profile_name::ProfileName;
@@ -23,8 +24,10 @@ fn username_link_parts(link: &str) -> Option<(Vec<u8>, Vec<u8>)> {
 }
 
 impl Daemon {
-    /// Reads blocked, hidden and archived state from the storage service.
-    pub(crate) async fn refresh_storage(&self) {
+    /// Reads blocked, hidden and archived state, and the installed sticker packs, from the
+    /// storage service. The packs are synced afterwards, in the background: downloading their
+    /// images must not hold up the startup or the receive loop.
+    pub(crate) async fn refresh_storage(self: Rc<Self>) {
         let service = match self.manager.storage_service().await {
             Ok(Some(service)) => service,
             Ok(None) => return, // no account entropy pool from the phone: nothing to read
@@ -55,6 +58,7 @@ impl Daemon {
             }
         }
         *self.storage_state.borrow_mut() = state;
+        tokio::task::spawn_local(self.sync_sticker_packs());
     }
 
     /// Address book name and profile name the storage service has for `uuid`.

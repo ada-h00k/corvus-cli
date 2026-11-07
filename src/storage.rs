@@ -22,11 +22,25 @@ use tracing::{info, warn};
 const STORAGE_RECORD_CONTACT: u32 = 1;
 const STORAGE_RECORD_GROUP_V2: u32 = 3;
 const STORAGE_RECORD_ACCOUNT: u32 = 4;
+const STORAGE_RECORD_STICKER_PACK: u32 = 6;
 pub const ACCOUNT_USERNAME: u32 = 33;
 pub const ACCOUNT_USERNAME_LINK: u32 = 35;
 pub const CONTACT_BLOCKED: u32 = 9;
 pub const CONTACT_HIDDEN: u32 = 20;
 pub const GROUP_BLOCKED: u32 = 2;
+// Identifier.Type values: installed sticker packs are records of their own. These protobuf
+// definitions do not know them (they predate the type), so it is matched as the raw number.
+const STICKER_PACK_RECORD_TYPE: i32 = 6;
+
+/// A sticker pack the storage service says is installed (StorageService.proto's
+/// InstalledStickerPackRecord: packId = 1 with 16 bytes, packKey = 2 with 32 bytes,
+/// position = 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StickerPackSync {
+    pub id: [u8; 16],
+    pub key: [u8; 32],
+    pub position: u32,
+}
 
 /// A contact as the storage service has it.
 #[derive(Debug, Default, Clone)]
@@ -55,6 +69,10 @@ pub struct State {
     pub blocked_numbers: HashSet<String>,
     pub blocked_groups: HashSet<[u8; 32]>,
     pub archived_groups: HashSet<[u8; 32]>,
+    /// Installed sticker packs, in the order the phone keeps (position, then pack id).
+    pub sticker_packs: Vec<StickerPackSync>,
+    /// Packs the storage service explicitly marks uninstalled (deletedAtTimestamp is set).
+    pub removed_sticker_packs: HashSet<[u8; 16]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -252,7 +270,86 @@ pub async fn read_state(service: &StorageService) -> anyhow::Result<State> {
             }
         }
     }
+    // Installed sticker packs: their type is unknown to these protobuf definitions, so their
+    // decrypted bytes are read raw and parsed here.
+    let pack_keys: Vec<Vec<u8>> = manifest
+        .identifiers
+        .iter()
+        .filter(|i| i.r#type == STICKER_PACK_RECORD_TYPE)
+        .map(|i| i.raw.clone())
+        .collect();
+    for chunk in pack_keys.chunks(500) {
+        for (_, bytes) in service.read_items_raw(chunk.to_vec(), ikm).await? {
+            match sticker_record(&bytes) {
+                StickerRecord::Installed(pack) => state.sticker_packs.push(pack),
+                StickerRecord::Removed(id) => drop(state.removed_sticker_packs.insert(id)),
+                StickerRecord::Other => {}
+            }
+        }
+    }
+    // Signal's display order: ascending position, then pack id.
+    state.sticker_packs.sort_by_key(|p| (p.position, p.id));
     Ok(state)
+}
+
+/// An installed sticker pack record, or the news that one was uninstalled.
+enum StickerRecord {
+    Installed(StickerPackSync),
+    Removed([u8; 16]),
+    Other,
+}
+
+/// Parses a record of type STICKER_PACK: its bytes are a StorageRecord whose oneof carries
+/// InstalledStickerPackRecord (packId = 1, packKey = 2, position = 3, deletedAtTimestamp = 4).
+/// A non-zero deletedAtTimestamp means the pack was uninstalled (packKey unset then); unknown
+/// fields of newer clients are skipped, as everywhere here.
+fn sticker_record(record: &[u8]) -> StickerRecord {
+    let Some((_, inner)) = find_len_field(record, STORAGE_RECORD_STICKER_PACK) else {
+        return StickerRecord::Other;
+    };
+    let (mut id, mut key, mut position, mut deleted) = (None, None, 0u32, 0u64);
+    let mut pos = inner.start;
+    while pos < inner.end {
+        let Some(tag) = get_varint(record, &mut pos) else { return StickerRecord::Other };
+        let (field, wire) = ((tag >> 3) as u32, tag & 7);
+        match wire {
+            0 => {
+                let Some(v) = get_varint(record, &mut pos) else { return StickerRecord::Other };
+                match field {
+                    3 => position = u32::try_from(v).unwrap_or(u32::MAX),
+                    4 => deleted = v,
+                    _ => {}
+                }
+            }
+            1 => pos += 8,
+            5 => pos += 4,
+            2 => {
+                let Some(len) = get_varint(record, &mut pos) else { return StickerRecord::Other };
+                let Some(end) = pos.checked_add(len as usize) else { return StickerRecord::Other };
+                if end > inner.end {
+                    return StickerRecord::Other;
+                }
+                if field == 1 {
+                    id = Some(record[pos..end].to_vec());
+                }
+                if field == 2 {
+                    key = Some(record[pos..end].to_vec());
+                }
+                pos = end;
+            }
+            _ => return StickerRecord::Other,
+        }
+    }
+    let Ok(id) = <[u8; 16]>::try_from(id.as_deref().unwrap_or_default()) else {
+        return StickerRecord::Other;
+    };
+    if deleted != 0 {
+        return StickerRecord::Removed(id);
+    }
+    let Ok(key) = <[u8; 32]>::try_from(key.as_deref().unwrap_or_default()) else {
+        return StickerRecord::Other;
+    };
+    StickerRecord::Installed(StickerPackSync { id, key, position })
 }
 
 // ---- writing -------------------------------------------------------------------------------
@@ -391,6 +488,48 @@ pub fn fetch_latest_sync() -> SyncMessage {
 mod tests {
     use super::*;
     use presage::proto::GroupV2Record;
+
+    fn len_field(field: u32, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_varint(&mut out, (u64::from(field) << 3) | 2);
+        put_varint(&mut out, bytes.len() as u64);
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    fn varint_field(field: u32, v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_varint(&mut out, u64::from(field) << 3);
+        put_varint(&mut out, v);
+        out
+    }
+
+    #[test]
+    fn sticker_pack_records() {
+        let (id, key) = ([7u8; 16], [9u8; 32]);
+        let mut pack = len_field(1, &id);
+        pack.extend(len_field(2, &key));
+        pack.extend(varint_field(3, 4));
+        // A field of a newer client must not hurt.
+        pack.extend(varint_field(11, 1));
+        let record = len_field(STORAGE_RECORD_STICKER_PACK, &pack);
+        let StickerRecord::Installed(p) = sticker_record(&record) else { panic!("must parse as installed") };
+        assert_eq!(p, StickerPackSync { id, key, position: 4 });
+
+        // Uninstalled: deletedAtTimestamp is set and the pack key is gone.
+        let mut removed = len_field(1, &id);
+        removed.extend(varint_field(4, 12345));
+        let record = len_field(STORAGE_RECORD_STICKER_PACK, &removed);
+        let StickerRecord::Removed(removed_id) = sticker_record(&record) else { panic!("must parse as removed") };
+        assert_eq!(removed_id, id);
+
+        // Broken records: not a sticker pack, wrong key length, garbage.
+        let mut bad = len_field(1, &id);
+        bad.extend(len_field(2, &[1, 2, 3]));
+        assert!(matches!(sticker_record(&len_field(STORAGE_RECORD_STICKER_PACK, &bad)), StickerRecord::Other));
+        assert!(matches!(sticker_record(b"nothing here"), StickerRecord::Other));
+        assert!(matches!(sticker_record(&varint_field(6, 1)), StickerRecord::Other));
+    }
 
     #[test]
     fn set_bool_changes_only_that_field() {

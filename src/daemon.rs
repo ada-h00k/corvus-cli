@@ -56,6 +56,9 @@ pub struct Daemon {
     pub(crate) storage_state: RefCell<crate::storage::State>,
     /// Sends are serialised: concurrent sends to one recipient would race on its session state.
     pub(crate) send_lock: Mutex<()>,
+    /// Sticker pack downloads are serialised: every storage change triggers a sync, and two of
+    /// them would download the same packs twice.
+    pub(crate) pack_sync: Mutex<()>,
 }
 
 pub(crate) enum Target {
@@ -89,6 +92,7 @@ impl Daemon {
             dir: Default::default(),
             group_keys: Default::default(),
             send_lock: Mutex::new(()),
+            pack_sync: Mutex::new(()),
         });
         daemon.reload_directory().await;
         daemon.reload_groups().await;
@@ -413,13 +417,13 @@ impl Daemon {
                             Received::Contacts => {
                                 info!("contacts synchronised");
                                 self.reload_directory().await;
-                                self.refresh_storage().await;
+                                self.clone().refresh_storage().await;
                             }
                             Received::DecryptionError(sender) => {
                                 warn!(sender = %sender.service_id_string(), "cannot decrypt a message");
                             }
                             Received::Content(content) => {
-                                if self.handle_content(&content).await {
+                                if self.clone().handle_content(&content).await {
                                     self.clone().acknowledge(&content);
                                 }
                             }
@@ -435,7 +439,7 @@ impl Daemon {
     }
 
     /// Announces a received message; false if it was ignored (blocked sender, control message).
-    async fn handle_content(&self, content: &Content) -> bool {
+    async fn handle_content(self: Rc<Self>, content: &Content) -> bool {
         let sender = content.metadata.sender.raw_uuid();
         if sender == self.self_aci {
             // The phone changed the storage service (blocked someone, archived a chat, …).

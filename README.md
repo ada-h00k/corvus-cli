@@ -55,6 +55,10 @@ and these additions, to be offered upstream:
   phone is told to read it again. Messages from blocked people and groups are ignored.
 - Attachments, link preview images and stickers are downloaded when a message arrives;
   delivery receipts are sent for received messages.
+- Sticker packs: the packs installed on the phone are read from the storage service and
+  downloaded from the sticker CDN, so `listStickerPacks` shows them; uninstalling a pack on the
+  phone removes it here as well. `addStickerPack` installs a signal.art link (and tells the
+  phone), `getSticker` returns a sticker image, and `send` accepts `sticker: "packId:stickerId"`.
 - Link previews are only sent when Corvus asks for one (presage's automatic previews are off).
 
 Data lives in `$XDG_DATA_HOME/corvus-signal` (or `$CORVUS_SIGNAL_DIR`), one directory per
