@@ -17,7 +17,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install native build dependencies
         run: |
@@ -37,25 +37,26 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test --locked
+        run: cargo test
 
       - name: Build release binary
-        run: cargo build --release --locked
+        run: cargo build --release
 
       - name: Prepare release asset
         run: cp target/release/corvus-signal corvus-signal-linux-x86_64
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: commit-${{ github.sha }}
+          target_commitish: ${{ github.sha }}
           name: corvus-signal ${{ github.sha }}
           body: |
-            Automated build for commit ${{ github.sha }}.
+            Automated stable build for commit ${{ github.sha }}.
 
             Source branch: ${{ github.ref_name }}
           files: corvus-signal-linux-x86_64
           fail_on_unmatched_files: true
           generate_release_notes: true
-          prerelease: true
-          make_latest: false
+          prerelease: false
+          make_latest: true
