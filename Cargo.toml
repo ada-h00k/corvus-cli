@@ -37,6 +37,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 [patch.crates-io]
 libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
 
+# Signal Server now requires the encrypted upload length when requesting a CDN upload form.
+# Keep the Corvus-specific presage integration while using the fixed service implementation.
+[patch."https://github.com/cyberneticangel/libsignal-service-rs"]
+libsignal-service = { git = "https://github.com/ada-h00k/libsignal-service-rs", rev = "ac4671b41fec9f381d24fc60f7c721e01650cf48" }
+
 # unoptimized ML-KEM can stack-overflow when decrypting PQXDH prekey messages
 [profile.dev.package.libcrux-ml-kem]
 opt-level = 3
