@@ -56,6 +56,8 @@ pub struct Daemon {
     pub(crate) storage_state: RefCell<crate::storage::State>,
     /// Sends are serialised: concurrent sends to one recipient would race on its session state.
     pub(crate) send_lock: Mutex<()>,
+    /// Avoid repeatedly resetting a peer while its messages fail to decrypt.
+    decryption_resets: RefCell<HashMap<Uuid, u64>>,
 }
 
 pub(crate) enum Target {
@@ -89,6 +91,7 @@ impl Daemon {
             dir: Default::default(),
             group_keys: Default::default(),
             send_lock: Mutex::new(()),
+            decryption_resets: Default::default(),
         });
         daemon.reload_directory().await;
         daemon.reload_groups().await;
@@ -417,6 +420,7 @@ impl Daemon {
                             }
                             Received::DecryptionError(sender) => {
                                 warn!(sender = %sender.service_id_string(), "cannot decrypt a message");
+                                self.recover_decryption_error(sender).await;
                             }
                             Received::Content(content) => {
                                 if self.handle_content(&content).await {
@@ -431,6 +435,36 @@ impl Daemon {
             }
             tokio::time::sleep(delay).await;
             delay = (delay * 2).min(Duration::from_secs(60));
+        }
+    }
+
+    /// Recover the pairwise session after a trusted sealed-sender envelope failed to decrypt.
+    /// This is Signal's automatic-session-reset fallback when a resend request cannot be used.
+    async fn recover_decryption_error(&self, sender: ServiceId) {
+        let ServiceId::Aci(aci) = sender else { return };
+        let uuid = Uuid::from(aci);
+        let timestamp = now_ms();
+        const COOLDOWN_MS: u64 = 60_000;
+
+        {
+            let mut resets = self.decryption_resets.borrow_mut();
+            if resets
+                .get(&uuid)
+                .is_some_and(|last| timestamp.saturating_sub(*last) < COOLDOWN_MS)
+            {
+                debug!(sender = %sender.service_id_string(), "session reset is cooling down after a decryption error");
+                return;
+            }
+            resets.insert(uuid, timestamp);
+        }
+
+        let mut manager = self.manager.clone();
+        match manager.send_session_reset(&sender, timestamp).await {
+            Ok(()) => info!(sender = %sender.service_id_string(), "requested a fresh Signal session after a decryption error"),
+            Err(error) => {
+                self.decryption_resets.borrow_mut().remove(&uuid);
+                warn!(%error, sender = %sender.service_id_string(), "could not reset the Signal session after a decryption error");
+            }
         }
     }
 
