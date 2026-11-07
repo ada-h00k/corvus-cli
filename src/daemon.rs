@@ -441,7 +441,7 @@ impl Daemon {
     /// Recover the pairwise session after a trusted sealed-sender envelope failed to decrypt.
     /// This is Signal's automatic-session-reset fallback when a resend request cannot be used.
     async fn recover_decryption_error(&self, sender: ServiceId) {
-        let Some(aci) = sender.aci() else { return };
+        let ServiceId::Aci(aci) = sender else { return };
         let uuid = Uuid::from(aci);
         let timestamp = now_ms();
         const COOLDOWN_MS: u64 = 60_000;
