@@ -15,8 +15,8 @@ path = "src/main.rs"
 # The corvus integration branch of presage (it uses the one of libsignal-service-rs): upstream plus
 # the open pull requests corvus needs and corvus' own additions, see README.md.
 # cdsi: contact discovery, to find a phone number nobody synced (libsignal-net, BoringSSL)
-presage = { git = "https://github.com/cyberneticangel/presage", rev = "16e33907d4dd9d0d3175c7838b4e00d2c49672e0", features = ["cdsi"] }
-presage-store-sqlite = { git = "https://github.com/cyberneticangel/presage", rev = "16e33907d4dd9d0d3175c7838b4e00d2c49672e0", features = ["cdsi"] }
+presage = { git = "https://github.com/ada-h00k/presage", rev = "16e33907d4dd9d0d3175c7838b4e00d2c49672e0", features = ["cdsi"] }
+presage-store-sqlite = { git = "https://github.com/ada-h00k/presage", rev = "16e33907d4dd9d0d3175c7838b4e00d2c49672e0", features = ["cdsi"] }
 
 anyhow = "1.0"
 base64 = "0.22"
