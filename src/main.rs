@@ -247,7 +247,12 @@ async fn json_rpc(accounts: &Accounts, account: &str) -> anyhow::Result<()> {
         tokio::task::spawn_local(async move {
             let result = daemon.call(&request.method, &request.params).await;
             if let Err(e) = &result {
-                error!(method = request.method, error = e.message, "call failed");
+                // Missing avatars are normal: Corvus tries the contact avatar first, then
+                // the profile avatar, and finally falls back to its generated placeholder.
+                let expected_avatar_miss = request.method == "getAvatar" && e.message == "No avatar found";
+                if !expected_avatar_miss {
+                    error!(method = request.method, error = e.message, "call failed");
+                }
             }
             if let Some(id) = request.id {
                 let _ = out.send(rpc::response(id, result));
