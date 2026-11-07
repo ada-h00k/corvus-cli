@@ -21,14 +21,14 @@ The binary is `target/release/corvus-signal`.
 
 corvus-signal needs work that is not in presage and libsignal-service-rs yet. It is built
 against integration branches of both, branch `corvus` of
-[cyberneticangel/presage](https://github.com/cyberneticangel/presage) and
-[cyberneticangel/libsignal-service-rs](https://github.com/cyberneticangel/libsignal-service-rs)
+[ada-h00k/presage](https://github.com/ada-h00k/presage) and
+[ada-h00k/libsignal-service-rs](https://github.com/ada-h00k/libsignal-service-rs)
 (pinned by commit in Cargo.toml and presage's Cargo.toml).
 
 To work on them, clone both forks next to this repository and add a `[patch]` section in a
 local, uncommitted change:
 
-    [patch."https://github.com/cyberneticangel/presage"]
+    [patch."https://github.com/ada-h00k/presage"]
     presage = { path = "../presage/presage" }
     presage-store-sqlite = { path = "../presage/presage-store-sqlite" }
 
