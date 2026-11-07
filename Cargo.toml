@@ -35,7 +35,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Same patches as the presage workspace; [patch] does not propagate from dependencies.
 [patch.crates-io]
-libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "858ae0a83b7d623563723d58d38c8c4e9298e466" }
+libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
 
 # Signal Server now requires the encrypted upload length when requesting a CDN upload form.
 # Keep the Corvus-specific presage integration while using the fixed service implementation.
