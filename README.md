@@ -53,6 +53,9 @@ and these additions, to be offered upstream:
 - Blocking, accepting message requests, and the username are written to the storage service
   (only the changed field of a record; fields this program doesn't know are kept), and the
   phone is told to read it again. Messages from blocked people and groups are ignored.
+- A message that cannot be decrypted is answered with a retry receipt (like the official
+  clients and signal-cli). The sender's devices then re-send it and re-share group sender
+  keys, so the messages after it arrive instead of being lost.
 - Attachments, link preview images and stickers are downloaded when a message arrives;
   delivery receipts are sent for received messages.
 - Link previews are only sent when Corvus asks for one (presage's automatic previews are off).
