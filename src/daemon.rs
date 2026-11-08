@@ -1142,16 +1142,44 @@ impl Daemon {
 
     async fn send_typing(&self, p: &Params) -> RpcResult {
         let timestamp = now_ms();
-        let action = if p.bool("stop") { Action::Stopped } else { Action::Started };
+        let started = !p.bool("stop");
+        let action = if started { Action::Started } else { Action::Stopped };
         let _guard = self.send_lock.lock().await;
         for target in self.targets(p).await? {
             let mut m = self.manager.clone();
             match target {
                 Target::Contact(sid) => {
+                    let typing_key = format!("contact:{}", sid.service_id_string());
+                    if !self.should_send_typing(typing_key, started) {
+                        continue;
+                    }
+                    // Typing indicators are ephemeral. Never queue them behind a server cooldown.
+                    if self.outbound_cooldown_remaining().is_some() {
+                        debug!("dropping typing indicator while Signal outbound sending is rate-limited");
+                        continue;
+                    }
+                    self.wait_for_outbound_slot().await?;
                     let typing = TypingMessage { timestamp: Some(timestamp), action: Some(action as i32), group_id: None };
-                    m.send_message(sid, ContentBody::TypingMessage(typing), timestamp).await?;
+                    let send_result = m.send_message(sid, ContentBody::TypingMessage(typing), timestamp).await;
+                    let error_message = send_result.as_ref().err().map(ToString::to_string);
+                    self.record_outbound_result(error_message.as_deref());
+                    if let Err(error) = send_result {
+                        if error_message.as_deref().is_some_and(is_signal_rate_limit) {
+                            debug!(%error, "Signal rate-limited a typing indicator; dropping it");
+                            return Ok(json!({"timestamp": timestamp, "results": []}));
+                        }
+                        return Err(error.into());
+                    }
                 }
                 Target::Group(key) => {
+                    let typing_key = format!("group:{}", BASE64_STANDARD.encode(key));
+                    if !self.should_send_typing(typing_key, started) {
+                        continue;
+                    }
+                    if self.outbound_cooldown_remaining().is_some() {
+                        debug!("dropping group typing indicator while Signal outbound sending is rate-limited");
+                        continue;
+                    }
                     let id = envelope::group_id(&key).and_then(|id| BASE64_STANDARD.decode(id).ok());
                     let typing = TypingMessage { timestamp: Some(timestamp), action: Some(action as i32), group_id: id };
                     // Typing has no sent transcript to sync, but send_message_to_group
@@ -1163,12 +1191,36 @@ impl Daemon {
                     match self.store().group(key).await? {
                         Some(group) => {
                             for aci in group.members.iter().map(|m| m.aci).filter(|a| Uuid::from(*a) != self.self_aci) {
-                                if let Err(e) = m.send_message(ServiceId::Aci(aci), ContentBody::TypingMessage(typing.clone()), timestamp).await {
-                                    warn!(%e, "cannot send a typing notification");
+                                if self.outbound_cooldown_remaining().is_some() {
+                                    debug!("stopping group typing fan-out because Signal outbound sending is rate-limited");
+                                    break;
+                                }
+                                self.wait_for_outbound_slot().await?;
+                                let result = m.send_message(ServiceId::Aci(aci), ContentBody::TypingMessage(typing.clone()), timestamp).await;
+                                let error_message = result.as_ref().err().map(ToString::to_string);
+                                self.record_outbound_result(error_message.as_deref());
+                                if let Err(error) = result {
+                                    if error_message.as_deref().is_some_and(is_signal_rate_limit) {
+                                        debug!(%error, "Signal rate-limited a group typing indicator; stopping fan-out");
+                                        break;
+                                    }
+                                    warn!(%error, "cannot send a typing notification");
                                 }
                             }
                         }
-                        None => m.send_message_to_group(&key, ContentBody::TypingMessage(typing), timestamp).await?,
+                        None => {
+                            self.wait_for_outbound_slot().await?;
+                            let result = m.send_message_to_group(&key, ContentBody::TypingMessage(typing), timestamp).await;
+                            let error_message = result.as_ref().err().map(ToString::to_string);
+                            self.record_outbound_result(error_message.as_deref());
+                            if let Err(error) = result {
+                                if error_message.as_deref().is_some_and(is_signal_rate_limit) {
+                                    debug!(%error, "Signal rate-limited a group typing indicator; dropping it");
+                                    return Ok(json!({"timestamp": timestamp, "results": []}));
+                                }
+                                return Err(error.into());
+                            }
+                        }
                     }
                 }
             }
