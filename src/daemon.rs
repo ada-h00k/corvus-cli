@@ -744,12 +744,7 @@ impl Daemon {
             _ => None,
         }
         .unwrap_or_else(|| content.metadata.client_timestamp.timestamp_millis() as u64);
-        tokio::task::spawn_local(async move {
-            let receipt = ReceiptMessage { r#type: Some(ReceiptType::Delivery as i32), timestamp: vec![timestamp] };
-            if let Err(e) = self.send_to(&[Target::Contact(sender)], ContentBody::ReceiptMessage(receipt), now_ms()).await {
-                debug!(error = e.message, "cannot send a delivery receipt");
-            }
-        });
+        self.queue_delivery_receipt(sender, timestamp);
     }
 
     /// The master key of the group a message belongs to.
@@ -1044,8 +1039,7 @@ impl Daemon {
             "delivery" => ReceiptType::Delivery,
             other => return Err(RpcError::invalid(format!("unknown receipt type '{other}'"))),
         };
-        let receipt = ReceiptMessage { r#type: Some(kind as i32), timestamp: p.u64s("targetTimestamps") };
-        self.send_to(&[Target::Contact(recipient)], ContentBody::ReceiptMessage(receipt), now_ms()).await
+        self.queue_receipt(recipient, kind as i32, p.u64s("targetTimestamps")).await
     }
 
     async fn send_typing(&self, p: &Params) -> RpcResult {
