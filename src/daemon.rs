@@ -255,7 +255,7 @@ impl Daemon {
                         }
                         Err(error) if is_signal_rate_limit(&error.message) => {
                             let delay = signal_retry_after(&error.message)
-                                .unwrap_or(Duration::from_secs(60))
+                                .unwrap_or(Duration::from_secs(600))
                                 .saturating_add(Duration::from_secs(1));
                             debug!(
                                 recipient = %recipient.service_id_string(),
