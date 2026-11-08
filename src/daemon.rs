@@ -1133,6 +1133,43 @@ impl Daemon {
     }
 }
 
+/// Whether Signal explicitly rejected a receipt because of its rate limit.
+fn is_receipt_rate_limit(message: &str) -> bool {
+    message.contains("Rate limit exceeded")
+}
+
+/// Parses Signal's "retry after PT..." hint. A missing or unfamiliar format is handled by
+/// the caller with a conservative fallback delay.
+fn receipt_retry_after(message: &str) -> Option<Duration> {
+    let lower = message.to_ascii_lowercase();
+    let marker = "retry after ";
+    let position = lower.find(marker)?;
+    let value = message.get(position + marker.len()..)?.split_whitespace().next()?;
+    let value = value.strip_prefix("PT")?;
+
+    let mut number = String::new();
+    let mut seconds = 0u64;
+    for unit in value.chars() {
+        if unit.is_ascii_digit() {
+            number.push(unit);
+            continue;
+        }
+        let amount: u64 = number.parse().ok()?;
+        number.clear();
+        let multiplier = match unit {
+            'H' => 60 * 60,
+            'M' => 60,
+            'S' => 1,
+            _ => return None,
+        };
+        seconds = seconds.checked_add(amount.checked_mul(multiplier)?)?;
+    }
+    if !number.is_empty() {
+        return None;
+    }
+    Some(Duration::from_secs(seconds))
+}
+
 /// The image of a received sticker, kept so getSticker works for packs that are not installed.
 fn sticker_pointers(body: &ContentBody) -> Vec<(AttachmentPointer, String)> {
     let dm = match body {
@@ -1163,4 +1200,42 @@ async fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
         tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
     }
     tokio::fs::rename(tmp, path).await
+}
+
+
+#[cfg(test)]
+mod receipt_queue_tests {
+    use super::*;
+
+    #[test]
+    fn parses_signal_retry_after_seconds() {
+        assert_eq!(
+            receipt_retry_after("Rate limit exceeded: retry after PT600S"),
+            Some(Duration::from_secs(600))
+        );
+    }
+
+    #[test]
+    fn parses_signal_retry_after_minutes_and_hours() {
+        assert_eq!(
+            receipt_retry_after("retry after PT10M"),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            receipt_retry_after("retry after PT1H2M3S"),
+            Some(Duration::from_secs(3723))
+        );
+    }
+
+    #[test]
+    fn unknown_retry_after_format_uses_fallback() {
+        assert_eq!(receipt_retry_after("Rate limit exceeded"), None);
+        assert_eq!(receipt_retry_after("retry after 600 seconds"), None);
+    }
+
+    #[test]
+    fn detects_only_the_signal_receipt_rate_limit_message() {
+        assert!(is_receipt_rate_limit("service error: Rate limit exceeded: retry after PT600S"));
+        assert!(!is_receipt_rate_limit("network unavailable"));
+    }
 }
