@@ -2,7 +2,7 @@
 // methods corvus calls. Everything runs on one thread (presage's store futures are !Send).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -55,6 +55,15 @@ impl Output {
     }
 }
 
+/// A receipt waiting to be coalesced and sent. RPC callers wait for the actual send result;
+/// automatic delivery receipts have no caller.
+struct ReceiptRequest {
+    recipient: ServiceId,
+    kind: i32,
+    timestamps: Vec<u64>,
+    response: Option<oneshot::Sender<RpcResult>>,
+}
+
 pub struct Daemon {
     pub(crate) manager: Mgr,
     out: mpsc::UnboundedSender<Output>,
@@ -69,6 +78,11 @@ pub struct Daemon {
     pub(crate) storage_state: RefCell<crate::storage::State>,
     /// Sends are serialised: concurrent sends to one recipient would race on its session state.
     pub(crate) send_lock: Mutex<()>,
+    /// All outgoing receipts share one queue so read, viewed and delivery receipts can be batched.
+    receipt_tx: mpsc::UnboundedSender<ReceiptRequest>,
+    receipt_rx: RefCell<Option<mpsc::UnboundedReceiver<ReceiptRequest>>>,
+    /// Recent successful receipts, keyed by recipient and type, to avoid resending timestamps.
+    receipt_history: RefCell<HashMap<(String, i32), VecDeque<u64>>>,
     /// Avoid repeatedly resetting a peer while its messages fail to decrypt.
     decryption_resets: RefCell<HashMap<Uuid, u64>>,
     /// Sticker pack downloads are serialised: every storage change triggers a sync, and two of
@@ -95,6 +109,7 @@ impl Daemon {
         let self_aci = Uuid::from(data.service_ids.aci());
         let attachments = attachments_dir(account_dir);
         private_dir(&attachments)?;
+        let (receipt_tx, receipt_rx) = mpsc::unbounded_channel();
         let daemon = Rc::new(Self {
             manager,
             out,
@@ -107,12 +122,182 @@ impl Daemon {
             dir: Default::default(),
             group_keys: Default::default(),
             send_lock: Mutex::new(()),
+            receipt_tx,
+            receipt_rx: RefCell::new(Some(receipt_rx)),
+            receipt_history: Default::default(),
             decryption_resets: Default::default(),
             pack_sync: Mutex::new(()),
         });
         daemon.reload_directory().await;
         daemon.reload_groups().await;
         Ok(daemon)
+    }
+
+    /// Starts the single receipt sender on the local task set.
+    pub(crate) fn start_receipt_worker(self: &Rc<Self>) {
+        let Some(receiver) = self.receipt_rx.borrow_mut().take() else { return };
+        let daemon = Rc::clone(self);
+        tokio::task::spawn_local(async move {
+            daemon.receipt_worker(receiver).await;
+        });
+    }
+
+    /// Collects nearby receipts, combines timestamps per recipient/type, and sends them serially.
+    async fn receipt_worker(self: Rc<Self>, mut receiver: mpsc::UnboundedReceiver<ReceiptRequest>) {
+        let mut last_send: Option<tokio::time::Instant> = None;
+        let mut pending = Vec::new();
+
+        loop {
+            if pending.is_empty() {
+                match receiver.recv().await {
+                    Some(request) => pending.push(request),
+                    None => break,
+                }
+            }
+
+            // Corvus often submits one read receipt per message. A short collection window turns
+            // those calls into one Signal receipt with multiple timestamps.
+            let collect = tokio::time::sleep(Duration::from_millis(250));
+            pin_mut!(collect);
+            loop {
+                tokio::select! {
+                    _ = &mut collect => break,
+                    request = receiver.recv() => match request {
+                        Some(request) => pending.push(request),
+                        None => break,
+                    }
+                }
+            }
+
+            let mut groups: Vec<Vec<ReceiptRequest>> = Vec::new();
+            for request in pending.drain(..) {
+                let recipient = request.recipient.service_id_string();
+                if let Some(group) = groups.iter_mut().find(|group| {
+                    group[0].kind == request.kind
+                        && group[0].recipient.service_id_string() == recipient
+                }) {
+                    group.push(request);
+                } else {
+                    groups.push(vec![request]);
+                }
+            }
+
+            for mut group in groups {
+                let recipient = group[0].recipient.clone();
+                let kind = group[0].kind;
+                let key = (recipient.service_id_string(), kind);
+                let mut timestamps: Vec<u64> = group.iter().flat_map(|r| r.timestamps.iter().copied()).collect();
+                timestamps.sort_unstable();
+                timestamps.dedup();
+
+                // A timestamp already accepted by Signal does not need another receipt.
+                if let Some(sent) = self.receipt_history.borrow().get(&key) {
+                    timestamps.retain(|timestamp| !sent.contains(timestamp));
+                }
+
+                if timestamps.is_empty() {
+                    let result = self.receipt_success_result(&recipient);
+                    for request in group {
+                        if let Some(response) = request.response {
+                            let _ = response.send(Ok(result.clone()));
+                        }
+                    }
+                    continue;
+                }
+
+                loop {
+                    // Smooth bursts across recipients as well as coalescing same-recipient calls.
+                    if let Some(last) = last_send {
+                        let next = last + Duration::from_millis(500);
+                        tokio::time::sleep_until(next).await;
+                    }
+
+                    let receipt = ReceiptMessage { r#type: Some(kind), timestamp: timestamps.clone() };
+                    let result = self
+                        .send_to(&[Target::Contact(recipient.clone())], ContentBody::ReceiptMessage(receipt), now_ms())
+                        .await;
+                    last_send = Some(tokio::time::Instant::now());
+
+                    match result {
+                        Ok(result) => {
+                            let mut history = self.receipt_history.borrow_mut();
+                            let sent = history.entry(key.clone()).or_default();
+                            for timestamp in &timestamps {
+                                if !sent.contains(timestamp) {
+                                    sent.push_back(*timestamp);
+                                }
+                            }
+                            while sent.len() > 2048 {
+                                sent.pop_front();
+                            }
+                            drop(history);
+
+                            for request in group {
+                                if let Some(response) = request.response {
+                                    let _ = response.send(Ok(result.clone()));
+                                }
+                            }
+                            break;
+                        }
+                        Err(error) if is_receipt_rate_limit(&error.message) => {
+                            let delay = receipt_retry_after(&error.message)
+                                .unwrap_or(Duration::from_secs(60))
+                                .saturating_add(Duration::from_secs(1));
+                            debug!(
+                                recipient = %recipient.service_id_string(),
+                                retry_after_seconds = delay.as_secs(),
+                                "Signal rate-limited receipts; keeping them queued"
+                            );
+                            tokio::time::sleep(delay).await;
+                            // Keep the timestamps and retry after Signal's stated cooldown.
+                        }
+                        Err(error) => {
+                            warn!(
+                                recipient = %recipient.service_id_string(),
+                                error = %error.message,
+                                "cannot send queued Signal receipts"
+                            );
+                            for request in group {
+                                if let Some(response) = request.response {
+                                    let _ = response.send(Err(RpcError::failed(error.message.clone())));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn receipt_success_result(&self, recipient: &ServiceId) -> Value {
+        json!({
+            "timestamp": now_ms(),
+            "results": [{"recipientAddress": self.address_json(recipient), "type": "SUCCESS"}]
+        })
+    }
+
+    async fn queue_receipt(&self, recipient: ServiceId, kind: i32, timestamps: Vec<u64>) -> RpcResult {
+        let (response, result) = oneshot::channel();
+        self.receipt_tx
+            .send(ReceiptRequest { recipient, kind, timestamps, response: Some(response) })
+            .map_err(|_| RpcError::failed("receipt queue is unavailable"))?;
+        result.await.map_err(|_| RpcError::failed("receipt worker stopped"))?
+    }
+
+    pub(crate) fn queue_delivery_receipt(&self, recipient: ServiceId, timestamp: u64) {
+        if self
+            .receipt_tx
+            .send(ReceiptRequest {
+                recipient,
+                kind: ReceiptType::Delivery as i32,
+                timestamps: vec![timestamp],
+                response: None,
+            })
+            .is_err()
+        {
+            debug!("receipt queue is unavailable; cannot queue delivery receipt");
+        }
     }
 
     pub(crate) fn store(&self) -> &SqliteStore {
@@ -559,12 +744,7 @@ impl Daemon {
             _ => None,
         }
         .unwrap_or_else(|| content.metadata.client_timestamp.timestamp_millis() as u64);
-        tokio::task::spawn_local(async move {
-            let receipt = ReceiptMessage { r#type: Some(ReceiptType::Delivery as i32), timestamp: vec![timestamp] };
-            if let Err(e) = self.send_to(&[Target::Contact(sender)], ContentBody::ReceiptMessage(receipt), now_ms()).await {
-                debug!(error = e.message, "cannot send a delivery receipt");
-            }
-        });
+        self.queue_delivery_receipt(sender, timestamp);
     }
 
     /// The master key of the group a message belongs to.
@@ -859,8 +1039,7 @@ impl Daemon {
             "delivery" => ReceiptType::Delivery,
             other => return Err(RpcError::invalid(format!("unknown receipt type '{other}'"))),
         };
-        let receipt = ReceiptMessage { r#type: Some(kind as i32), timestamp: p.u64s("targetTimestamps") };
-        self.send_to(&[Target::Contact(recipient)], ContentBody::ReceiptMessage(receipt), now_ms()).await
+        self.queue_receipt(recipient, kind as i32, p.u64s("targetTimestamps")).await
     }
 
     async fn send_typing(&self, p: &Params) -> RpcResult {
@@ -954,6 +1133,43 @@ impl Daemon {
     }
 }
 
+/// Whether Signal explicitly rejected a receipt because of its rate limit.
+fn is_receipt_rate_limit(message: &str) -> bool {
+    message.contains("Rate limit exceeded")
+}
+
+/// Parses Signal's "retry after PT..." hint. A missing or unfamiliar format is handled by
+/// the caller with a conservative fallback delay.
+fn receipt_retry_after(message: &str) -> Option<Duration> {
+    let lower = message.to_ascii_lowercase();
+    let marker = "retry after ";
+    let position = lower.find(marker)?;
+    let value = message.get(position + marker.len()..)?.split_whitespace().next()?;
+    let value = value.strip_prefix("PT")?;
+
+    let mut number = String::new();
+    let mut seconds = 0u64;
+    for unit in value.chars() {
+        if unit.is_ascii_digit() {
+            number.push(unit);
+            continue;
+        }
+        let amount: u64 = number.parse().ok()?;
+        number.clear();
+        let multiplier = match unit {
+            'H' => 60 * 60,
+            'M' => 60,
+            'S' => 1,
+            _ => return None,
+        };
+        seconds = seconds.checked_add(amount.checked_mul(multiplier)?)?;
+    }
+    if !number.is_empty() {
+        return None;
+    }
+    Some(Duration::from_secs(seconds))
+}
+
 /// The image of a received sticker, kept so getSticker works for packs that are not installed.
 fn sticker_pointers(body: &ContentBody) -> Vec<(AttachmentPointer, String)> {
     let dm = match body {
@@ -984,4 +1200,42 @@ async fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
         tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
     }
     tokio::fs::rename(tmp, path).await
+}
+
+
+#[cfg(test)]
+mod receipt_queue_tests {
+    use super::*;
+
+    #[test]
+    fn parses_signal_retry_after_seconds() {
+        assert_eq!(
+            receipt_retry_after("Rate limit exceeded: retry after PT600S"),
+            Some(Duration::from_secs(600))
+        );
+    }
+
+    #[test]
+    fn parses_signal_retry_after_minutes_and_hours() {
+        assert_eq!(
+            receipt_retry_after("retry after PT10M"),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            receipt_retry_after("retry after PT1H2M3S"),
+            Some(Duration::from_secs(3723))
+        );
+    }
+
+    #[test]
+    fn unknown_retry_after_format_uses_fallback() {
+        assert_eq!(receipt_retry_after("Rate limit exceeded"), None);
+        assert_eq!(receipt_retry_after("retry after 600 seconds"), None);
+    }
+
+    #[test]
+    fn detects_only_the_signal_receipt_rate_limit_message() {
+        assert!(is_receipt_rate_limit("service error: Rate limit exceeded: retry after PT600S"));
+        assert!(!is_receipt_rate_limit("network unavailable"));
+    }
 }
