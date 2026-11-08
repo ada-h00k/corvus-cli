@@ -196,10 +196,13 @@ fn list_accounts(accounts: &Accounts, json: bool) -> anyhow::Result<()> {
 
 async fn link(accounts: &Accounts, device_name: String) -> anyhow::Result<()> {
     let staging = accounts.staging_dir()?;
+    // Keep a handle to the shared SQLite pool so it can be closed explicitly after
+    // linking. Dropping the manager alone does not wait for SQLx connections to close;
+    // on Windows this can leave store.db3/WAL files locked when the directory is renamed.
     let store = open_store(&staging).await?;
     let (url_tx, url_rx) = oneshot::channel();
     let (linked, ()) = future::join(
-        Manager::link_secondary_device(store, SignalServers::Production, device_name, url_tx),
+        Manager::link_secondary_device(store.clone(), SignalServers::Production, device_name, url_tx),
         async move {
             if let Ok(url) = url_rx.await {
                 // corvus reads the first stdout line starting with sgnl:// and shows it as a QR code.
@@ -212,7 +215,12 @@ async fn link(accounts: &Accounts, device_name: String) -> anyhow::Result<()> {
     let manager = match linked {
         Ok(manager) => manager,
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&staging);
+            // Close the pool before removing its directory (required on Windows, where
+            // open SQLite files cannot be unlinked).
+            store.close().await;
+            if let Err(cleanup_error) = std::fs::remove_dir_all(&staging) {
+                warn!(path = %staging.display(), %cleanup_error, "cannot remove failed link staging directory");
+            }
             bail!("Linking failed: {e}");
         }
     };
@@ -220,6 +228,9 @@ async fn link(accounts: &Accounts, device_name: String) -> anyhow::Result<()> {
     let number = e164(&data.phone_number);
     let aci = Uuid::from(data.service_ids.aci()).to_string();
     drop(manager);
+    // Wait until every SQLx connection is closed before moving the account directory.
+    // Windows keeps SQLite database/WAL files locked until the pool has fully shut down.
+    store.close().await;
     accounts.register(&staging, &number, &aci)?;
     println!("Associated with: {number}");
     Ok(())
