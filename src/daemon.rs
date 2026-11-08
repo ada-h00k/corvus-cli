@@ -1159,7 +1159,7 @@ fn session_reset_backoff(message: &str) -> Duration {
 
 /// Parses Signal's "retry after PT..." hint. A missing or unfamiliar format is handled by
 /// the caller with a conservative fallback delay.
-fn receipt_retry_after(message: &str) -> Option<Duration> {
+fn signal_retry_after(message: &str) -> Option<Duration> {
     let lower = message.to_ascii_lowercase();
     let marker = "retry after ";
     let position = lower.find(marker)?;
@@ -1229,7 +1229,7 @@ mod receipt_queue_tests {
     #[test]
     fn parses_signal_retry_after_seconds() {
         assert_eq!(
-            receipt_retry_after("Rate limit exceeded: retry after PT600S"),
+            signal_retry_after("Rate limit exceeded: retry after PT600S"),
             Some(Duration::from_secs(600))
         );
     }
@@ -1237,19 +1237,19 @@ mod receipt_queue_tests {
     #[test]
     fn parses_signal_retry_after_minutes_and_hours() {
         assert_eq!(
-            receipt_retry_after("retry after PT10M"),
+            signal_retry_after("retry after PT10M"),
             Some(Duration::from_secs(600))
         );
         assert_eq!(
-            receipt_retry_after("retry after PT1H2M3S"),
+            signal_retry_after("retry after PT1H2M3S"),
             Some(Duration::from_secs(3723))
         );
     }
 
     #[test]
     fn unknown_retry_after_format_uses_fallback() {
-        assert_eq!(receipt_retry_after("Rate limit exceeded"), None);
-        assert_eq!(receipt_retry_after("retry after 600 seconds"), None);
+        assert_eq!(signal_retry_after("Rate limit exceeded"), None);
+        assert_eq!(signal_retry_after("retry after 600 seconds"), None);
     }
 
     #[test]
