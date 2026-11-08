@@ -29,7 +29,7 @@ use presage::store::{ContentsStore, Store};
 use presage::Manager;
 use presage_store_sqlite::SqliteStore;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::envelope::{self, Directory, Person};
@@ -42,9 +42,22 @@ use crate::textstyle;
 
 type Mgr = Manager<SqliteStore, Registered>;
 
+/// One stdout item. Incoming notifications carry a completion sender so the receive loop
+/// waits until Corvus has actually received the complete JSON line before sending a receipt.
+pub(crate) struct Output {
+    pub(crate) value: Value,
+    pub(crate) written: Option<oneshot::Sender<Result<(), String>>>,
+}
+
+impl Output {
+    pub(crate) fn queued(value: Value) -> Self {
+        Self { value, written: None }
+    }
+}
+
 pub struct Daemon {
     pub(crate) manager: Mgr,
-    out: mpsc::UnboundedSender<Value>,
+    out: mpsc::UnboundedSender<Output>,
     attachments: PathBuf,
     pub(crate) account: String,
     pub(crate) self_aci: Uuid,
@@ -56,6 +69,8 @@ pub struct Daemon {
     pub(crate) storage_state: RefCell<crate::storage::State>,
     /// Sends are serialised: concurrent sends to one recipient would race on its session state.
     pub(crate) send_lock: Mutex<()>,
+    /// Avoid repeatedly resetting a peer while its messages fail to decrypt.
+    decryption_resets: RefCell<HashMap<Uuid, u64>>,
     /// Sticker pack downloads are serialised: every storage change triggers a sync, and two of
     /// them would download the same packs twice.
     pub(crate) pack_sync: Mutex<()>,
@@ -71,7 +86,7 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 impl Daemon {
-    pub async fn new(manager: Mgr, account_dir: &Path, out: mpsc::UnboundedSender<Value>) -> anyhow::Result<Rc<Self>> {
+    pub async fn new(manager: Mgr, account_dir: &Path, out: mpsc::UnboundedSender<Output>) -> anyhow::Result<Rc<Self>> {
         // corvus decides about link previews itself and passes them with `send` (previewUrl …);
         // presage would otherwise fetch every linked page, revealing the user's IP address to it.
         manager.set_automatic_link_previews(false);
@@ -92,6 +107,7 @@ impl Daemon {
             dir: Default::default(),
             group_keys: Default::default(),
             send_lock: Mutex::new(()),
+            decryption_resets: Default::default(),
             pack_sync: Mutex::new(()),
         });
         daemon.reload_directory().await;
@@ -421,6 +437,7 @@ impl Daemon {
                             }
                             Received::DecryptionError(sender) => {
                                 warn!(sender = %sender.service_id_string(), "cannot decrypt a message");
+                                self.recover_decryption_error(sender).await;
                             }
                             Received::Content(content) => {
                                 if self.clone().handle_content(&content).await {
@@ -438,7 +455,37 @@ impl Daemon {
         }
     }
 
-    /// Announces a received message; false if it was ignored (blocked sender, control message).
+    /// Recover the pairwise session after a trusted sealed-sender envelope failed to decrypt.
+    /// This is Signal's automatic-session-reset fallback when a resend request cannot be used.
+    async fn recover_decryption_error(&self, sender: ServiceId) {
+        let ServiceId::Aci(aci) = sender else { return };
+        let uuid = Uuid::from(aci);
+        let timestamp = now_ms();
+        const COOLDOWN_MS: u64 = 60_000;
+
+        {
+            let mut resets = self.decryption_resets.borrow_mut();
+            if resets
+                .get(&uuid)
+                .is_some_and(|last| timestamp.saturating_sub(*last) < COOLDOWN_MS)
+            {
+                debug!(sender = %sender.service_id_string(), "session reset is cooling down after a decryption error");
+                return;
+            }
+            resets.insert(uuid, timestamp);
+        }
+
+        let mut manager = self.manager.clone();
+        match manager.send_session_reset(&sender, timestamp).await {
+            Ok(()) => info!(sender = %sender.service_id_string(), "requested a fresh Signal session after a decryption error"),
+            Err(error) => {
+                self.decryption_resets.borrow_mut().remove(&uuid);
+                warn!(%error, sender = %sender.service_id_string(), "could not reset the Signal session after a decryption error");
+            }
+        }
+    }
+
+    /// Announces a received message; false if it was ignored or could not be forwarded to Corvus.
     async fn handle_content(self: Rc<Self>, content: &Content) -> bool {
         let sender = content.metadata.sender.raw_uuid();
         if sender == self.self_aci {
@@ -488,7 +535,10 @@ impl Daemon {
         }
         let envelope = envelope::to_envelope(&self.dir.borrow(), content);
         if let Some(envelope) = envelope {
-            self.emit(rpc::notification("receive", json!({"envelope": envelope, "account": self.account})));
+            if !self.emit(rpc::notification("receive", json!({"envelope": envelope, "account": self.account}))).await {
+                warn!("cannot forward received message to Corvus; leaving it unacknowledged");
+                return false;
+            }
         }
         true
     }
@@ -548,8 +598,12 @@ impl Daemon {
         }
     }
 
-    fn emit(&self, value: Value) {
-        let _ = self.out.send(value);
+    async fn emit(&self, value: Value) -> bool {
+        let (written_tx, written_rx) = oneshot::channel();
+        if self.out.send(Output { value, written: Some(written_tx) }).is_err() {
+            return false;
+        }
+        matches!(written_rx.await, Ok(Ok(())))
     }
 
     // ---- methods ---------------------------------------------------------------------------
