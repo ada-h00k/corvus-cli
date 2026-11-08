@@ -64,6 +64,12 @@ struct ReceiptRequest {
     response: Option<oneshot::Sender<RpcResult>>,
 }
 
+#[derive(Default)]
+struct TypingState {
+    active: bool,
+    last_sent: Option<tokio::time::Instant>,
+}
+
 pub struct Daemon {
     pub(crate) manager: Mgr,
     out: mpsc::UnboundedSender<Output>,
@@ -83,6 +89,11 @@ pub struct Daemon {
     receipt_rx: RefCell<Option<mpsc::UnboundedReceiver<ReceiptRequest>>>,
     /// Recent successful receipts, keyed by recipient and type, to avoid resending timestamps.
     receipt_history: RefCell<HashMap<(String, i32), VecDeque<u64>>>,
+    /// Enforce a minimum gap and a global server-imposed cooldown for every outbound request.
+    outbound_last_send: RefCell<Option<tokio::time::Instant>>,
+    outbound_blocked_until: RefCell<Option<tokio::time::Instant>>,
+    /// Coalesce repeated typing notifications by conversation.
+    typing_state: RefCell<HashMap<String, TypingState>>,
     /// Next allowed session-reset attempt per sender (Unix milliseconds).
     decryption_reset_retry_at: RefCell<HashMap<Uuid, u64>>,
     /// Sticker pack downloads are serialised: every storage change triggers a sync, and two of
@@ -125,6 +136,9 @@ impl Daemon {
             receipt_tx,
             receipt_rx: RefCell::new(Some(receipt_rx)),
             receipt_history: Default::default(),
+            outbound_last_send: Default::default(),
+            outbound_blocked_until: Default::default(),
+            typing_state: Default::default(),
             decryption_reset_retry_at: Default::default(),
             pack_sync: Mutex::new(()),
         });
@@ -297,6 +311,75 @@ impl Daemon {
             .is_err()
         {
             debug!("receipt queue is unavailable; cannot queue delivery receipt");
+        }
+    }
+
+    /// How long Signal's global outbound cooldown still has to run, if any.
+    fn outbound_cooldown_remaining(&self) -> Option<Duration> {
+        self.outbound_blocked_until
+            .borrow()
+            .and_then(|until| until.checked_duration_since(tokio::time::Instant::now()))
+    }
+
+    /// Fail locally while Signal has an active cooldown; otherwise space outbound requests.
+    async fn wait_for_outbound_slot(&self) -> Result<(), RpcError> {
+        if let Some(remaining) = self.outbound_cooldown_remaining() {
+            let seconds = remaining.as_secs().saturating_add(u64::from(remaining.subsec_nanos() > 0));
+            return Err(RpcError::failed(format!(
+                "Rate limit exceeded: retry after PT{seconds}S (locally paused; no request sent)"
+            )));
+        }
+
+        if let Some(last) = *self.outbound_last_send.borrow() {
+            let next = last + Duration::from_secs(1);
+            if next > tokio::time::Instant::now() {
+                tokio::time::sleep_until(next).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remember that a request went out and install a process-wide cooldown on a server limit.
+    fn record_outbound_result(&self, error: Option<&str>) {
+        let now = tokio::time::Instant::now();
+        *self.outbound_last_send.borrow_mut() = Some(now);
+        let Some(message) = error.filter(|message| is_signal_rate_limit(message)) else { return };
+
+        let delay = signal_retry_after(message)
+            .unwrap_or(Duration::from_secs(600))
+            .saturating_add(Duration::from_secs(1));
+        let until = now + delay;
+        let mut blocked_until = self.outbound_blocked_until.borrow_mut();
+        if blocked_until.is_none_or(|current| current < until) {
+            *blocked_until = Some(until);
+        }
+        warn!(
+            retry_after_seconds = delay.as_secs(),
+            "Signal rate-limited an outbound request; pausing all outbound sends"
+        );
+    }
+
+    /// Return true only for a useful typing state transition or a periodic refresh.
+    fn should_send_typing(&self, key: String, started: bool) -> bool {
+        const REFRESH_INTERVAL: Duration = Duration::from_secs(8);
+        let now = tokio::time::Instant::now();
+        let mut states = self.typing_state.borrow_mut();
+        let state = states.entry(key).or_default();
+        if started {
+            if state.active
+                && state.last_sent.is_some_and(|last| now.duration_since(last) < REFRESH_INTERVAL)
+            {
+                return false;
+            }
+            state.active = true;
+            state.last_sent = Some(now);
+            true
+        } else if state.active {
+            state.active = false;
+            state.last_sent = Some(now);
+            true
+        } else {
+            false
         }
     }
 
