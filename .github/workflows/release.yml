@@ -29,7 +29,9 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bin: corvus-cli.exe
-            asset: corvus-cli-windows-x86_64.exe
+            # Zip (not a raw file): SQLCipher links OpenSSL dynamically on
+            # Windows, so libcrypto-3-x64.dll must ship next to the exe.
+            asset: corvus-cli-windows-x86_64.zip
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     defaults:
@@ -59,7 +61,19 @@ jobs:
 
       - name: Install native build dependencies (Windows)
         if: runner.os == 'Windows'
-        run: choco install protoc nasm -y
+        run: |
+          choco install protoc nasm -y
+          # SQLCipher (libsqlite3-sys) links OpenSSL and requires OPENSSL_DIR on
+          # Windows. Dynamic triplet: a static libcrypto would clash with the
+          # BoringSSL symbols (EVP_*, SHA256, ...) already linked statically
+          # via presage/libsignal.
+          vcpkg install openssl --triplet x64-windows
+          VCPKG_INSTALLED="$VCPKG_INSTALLATION_ROOT/installed/x64-windows"
+          {
+            echo "OPENSSL_DIR=$VCPKG_INSTALLED"
+            echo "OPENSSL_LIB_DIR=$VCPKG_INSTALLED/lib"
+            echo "OPENSSL_INCLUDE_DIR=$VCPKG_INSTALLED/include"
+          } >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -80,8 +94,17 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Prepare release asset
+      - name: Prepare release asset (Linux, macOS)
+        if: runner.os != 'Windows'
         run: cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "${{ matrix.asset }}"
+
+      - name: Prepare release asset (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" dist/
+          cp "$VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/"libcrypto*.dll dist/
+          (cd dist && 7z a -tzip "../${{ matrix.asset }}" .)
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
