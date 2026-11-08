@@ -330,7 +330,8 @@ impl Daemon {
             )));
         }
 
-        if let Some(last) = *self.outbound_last_send.borrow() {
+        let last_send = *self.outbound_last_send.borrow();
+        if let Some(last) = last_send {
             let next = last + Duration::from_secs(1);
             if next > tokio::time::Instant::now() {
                 tokio::time::sleep_until(next).await;
