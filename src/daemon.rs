@@ -752,8 +752,28 @@ impl Daemon {
             retry_at.insert(uuid, timestamp.saturating_add(COOLDOWN_MS));
         }
 
+        let _guard = self.send_lock.lock().await;
+        if let Some(remaining) = self.outbound_cooldown_remaining() {
+            let retry_ms = remaining.as_millis().min(u64::MAX as u128) as u64;
+            self.decryption_reset_retry_at
+                .borrow_mut()
+                .insert(uuid, timestamp.saturating_add(retry_ms));
+            debug!(
+                sender = %sender.service_id_string(),
+                retry_after_seconds = remaining.as_secs(),
+                "skipping session reset while Signal outbound sending is rate-limited"
+            );
+            return;
+        }
+        if self.wait_for_outbound_slot().await.is_err() {
+            return;
+        }
+
         let mut manager = self.manager.clone();
-        match manager.send_session_reset(&sender, timestamp).await {
+        let reset_result = manager.send_session_reset(&sender, timestamp).await;
+        let error_message = reset_result.as_ref().err().map(ToString::to_string);
+        self.record_outbound_result(error_message.as_deref());
+        match reset_result {
             Ok(()) => info!(sender = %sender.service_id_string(), "requested a fresh Signal session after a decryption error"),
             Err(error) => {
                 let message = error.to_string();
