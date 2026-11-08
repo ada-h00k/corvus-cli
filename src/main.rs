@@ -27,7 +27,7 @@ use presage::Manager;
 use presage_store_sqlite::SqliteStore;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::store::{e164, open_store, Accounts};
 
