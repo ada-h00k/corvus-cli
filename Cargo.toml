@@ -1,5 +1,5 @@
 [package]
-name = "corvus-signal"
+name = "corvus-cli"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
@@ -7,7 +7,7 @@ license = "AGPL-3.0-only"
 description = "signal-cli compatible JSON-RPC backend for corvus, built on presage"
 
 [[bin]]
-name = "corvus-signal"
+name = "corvus-cli"
 path = "src/main.rs"
 
 # Kept apart from history-store so its minimal-dependency policy is unaffected.

@@ -5,7 +5,7 @@ in place of the Java signal-cli. It runs the same command lines Corvus gives sig
 (`--version`, `-o json listAccounts`, `link -n NAME`, `-a ACCOUNT jsonRpc`) and speaks
 signal-cli's JSON-RPC on stdin/stdout, so Corvus works with either.
 
-To use it, build it (below) and choose the `corvus-signal` program in Corvus under
+To use it, build it (below) and choose the `corvus-cli` program in Corvus under
 Settings → Advanced → Choose …. It has its own device link: Corvus offers to link the computer
 with the phone again (the chat history in Corvus is kept).
 
@@ -15,11 +15,11 @@ Needs Rust 1.85+, `protoc`, and clang and cmake (libsignal's BoringSSL).
 
     cargo build --release
 
-The binary is `target/release/corvus-signal`.
+The binary is `target/release/corvus-cli`.
 
 ## presage and libsignal-service
 
-corvus-signal needs work that is not in presage and libsignal-service-rs yet. It is built
+corvus-cli needs work that is not in presage and libsignal-service-rs yet. It is built
 against integration branches of both, branch `corvus` of
 [ada-h00k/presage](https://github.com/ada-h00k/presage) and
 [ada-h00k/libsignal-service-rs](https://github.com/ada-h00k/libsignal-service-rs)
@@ -61,14 +61,14 @@ and these additions, to be offered upstream:
   phone), `getSticker` returns a sticker image, and `send` accepts `sticker: "packId:stickerId"`.
 - Link previews are only sent when Corvus asks for one (presage's automatic previews are off).
 
-Data lives in `$XDG_DATA_HOME/corvus-signal` (or `$CORVUS_SIGNAL_DIR`), one directory per
-account. `CORVUS_SIGNAL_LOG` sets the log filter (stderr); `-v`/`-vv` raise the level.
+Data lives in `$XDG_DATA_HOME/corvus-cli` (or `$CORVUS_CLI_DIR`), one directory per
+account. `CORVUS_CLI_LOG` sets the log filter (stderr); `-v`/`-vv` raise the level.
 
 ## Tests
 
     cargo test
 
-`src/contract.rs` writes the JSON corvus-signal emits to `tests/data/corvus-signal-contract.json`
+`src/contract.rs` writes the JSON corvus-cli emits to `tests/data/corvus-cli-contract.json`
 (`CORVUS_UPDATE_CONTRACT=1 cargo test`). Corvus keeps a copy of this file and its
 `tests/backend_contract_test.cpp` checks that Corvus' parsers read it as intended, so after a
 change that alters the JSON, copy the regenerated file into the Corvus repository.

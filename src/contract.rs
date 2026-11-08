@@ -1,4 +1,4 @@
-// The JSON corvus-signal emits, written to tests/data/corvus-signal-contract.json. Corvus keeps a
+// The JSON corvus-cli emits, written to tests/data/corvus-cli-contract.json. Corvus keeps a
 // copy of that file (tests/data/) and feeds it through its own parsers in
 // tests/backend_contract_test.cpp. Regenerate after a change with CORVUS_UPDATE_CONTRACT=1 cargo test,
 // then copy the file into the Corvus repository.
@@ -248,7 +248,7 @@ fn cases() -> Value {
 
 #[test]
 fn contract_fixture_is_current() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/corvus-signal-contract.json");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/corvus-cli-contract.json");
     let current = serde_json::to_string_pretty(&cases()).unwrap() + "\n";
     if std::env::var_os("CORVUS_UPDATE_CONTRACT").is_some() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

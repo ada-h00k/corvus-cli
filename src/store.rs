@@ -1,5 +1,5 @@
 // On-disk layout: <data dir>/accounts/<aci>/{store.db3,attachments/} plus accounts.json (number -> aci).
-// The data dir is $CORVUS_SIGNAL_DIR, else $XDG_DATA_HOME/corvus-signal, else ~/.local/share/corvus-signal.
+// The data dir is $CORVUS_CLI_DIR, else $XDG_DATA_HOME/corvus-cli, else ~/.local/share/corvus-cli.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -14,14 +14,14 @@ pub fn data_dir(config: Option<&Path>) -> PathBuf {
     if let Some(dir) = config {
         return dir.to_path_buf();
     }
-    if let Some(dir) = std::env::var_os("CORVUS_SIGNAL_DIR") {
+    if let Some(dir) = std::env::var_os("CORVUS_CLI_DIR") {
         return dir.into();
     }
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .unwrap_or_else(|| home().join(".local/share"));
-    base.join("corvus-signal")
+    base.join("corvus-cli")
 }
 
 fn home() -> PathBuf {

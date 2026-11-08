@@ -23,7 +23,7 @@ impl RpcError {
     }
 
     pub fn unsupported(method: &str) -> Self {
-        Self { code: METHOD_NOT_FOUND, message: format!("{method} is not supported by corvus-signal yet") }
+        Self { code: METHOD_NOT_FOUND, message: format!("{method} is not supported by corvus-cli yet") }
     }
 }
 

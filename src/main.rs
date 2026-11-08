@@ -1,4 +1,4 @@
-// corvus-signal: a signal-cli compatible backend built on presage.
+// corvus-cli: a signal-cli compatible backend built on presage.
 // Implements the command lines corvus runs: --version, listAccounts, link and jsonRpc.
 
 mod account;
@@ -93,11 +93,11 @@ fn option(rest: &[String], short: &str, long: &str) -> Option<String> {
 fn init_logging(verbosity: u8) {
     // stderr is shown to the user by corvus, so only problems are logged by default.
     let default = match verbosity {
-        0 => "corvus_signal=warn,presage=error,libsignal_service=error",
-        1 => "corvus_signal=info,presage=info,libsignal_service=warn",
+        0 => "corvus_cli=warn,presage=error,libsignal_service=error",
+        1 => "corvus_cli=info,presage=info,libsignal_service=warn",
         _ => "debug",
     };
-    let filter = tracing_subscriber::EnvFilter::try_from_env("CORVUS_SIGNAL_LOG")
+    let filter = tracing_subscriber::EnvFilter::try_from_env("CORVUS_CLI_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
     tracing_subscriber::fmt().with_writer(std::io::stderr).with_env_filter(filter).with_target(false).init();
 }
@@ -112,7 +112,7 @@ fn main() -> ExitCode {
     };
     init_logging(args.verbosity);
     if args.version {
-        println!("corvus-signal {VERSION} compatible with signal-cli {COMPAT_VERSION}");
+        println!("corvus-cli {VERSION} compatible with signal-cli {COMPAT_VERSION}");
         return ExitCode::SUCCESS;
     }
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -137,7 +137,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     match args.command.as_deref() {
         Some("listAccounts") => list_accounts(&accounts, args.json_output),
         Some("link") => {
-            let name = option(&args.rest, "-n", "--name").unwrap_or_else(|| "corvus-signal".into());
+            let name = option(&args.rest, "-n", "--name").unwrap_or_else(|| "corvus-cli".into());
             link(&accounts, name).await
         }
         Some("jsonRpc") => {
@@ -147,7 +147,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             };
             json_rpc(&accounts, &account).await
         }
-        Some(other) => bail!("Command {other} is not supported by corvus-signal"),
+        Some(other) => bail!("Command {other} is not supported by corvus-cli"),
         None => bail!("No command given (supported: link, listAccounts, jsonRpc)"),
     }
 }

@@ -147,7 +147,7 @@ mod tests {
     use presage::libsignal_service::protocol::IdentityKeyPair;
 
     fn tmp() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("corvus-signal-trust-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let dir = std::env::temp_dir().join(format!("corvus-cli-trust-{}-{:?}", std::process::id(), std::thread::current().id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
