@@ -13,10 +13,12 @@ path = "src/main.rs"
 # Kept apart from history-store so its minimal-dependency policy is unaffected.
 [dependencies]
 # The corvus integration branch of presage (it uses the one of libsignal-service-rs): upstream plus
-# the open pull requests corvus needs and corvus' own additions, see README.md.
+# the open pull requests corvus needs and corvus' own additions, see README.md. This rev adds the
+# lock that serialises session state between sending and receiving (sessions overwritten by a
+# concurrent send made incoming messages fail with "invalid Whisper message: decryption failed").
 # cdsi: contact discovery, to find a phone number nobody synced (libsignal-net, BoringSSL)
-presage = { git = "https://github.com/ada-h00k/presage", rev = "16e33907d4dd9d0d3175c7838b4e00d2c49672e0", features = ["cdsi"] }
-presage-store-sqlite = { git = "https://github.com/ada-h00k/presage", rev = "16e33907d4dd9d0d3175c7838b4e00d2c49672e0", features = ["cdsi"] }
+presage = { git = "https://github.com/cyberneticangel/presage", rev = "f0dcc9e1c446bf7117ee6483f1af4454c795c66e", features = ["cdsi"] }
+presage-store-sqlite = { git = "https://github.com/cyberneticangel/presage", rev = "f0dcc9e1c446bf7117ee6483f1af4454c795c66e", features = ["cdsi"] }
 
 anyhow = "1.0"
 base64 = "0.22"
