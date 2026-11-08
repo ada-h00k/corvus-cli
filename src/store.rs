@@ -70,8 +70,11 @@ impl Accounts {
     fn save(&self, index: &BTreeMap<String, String>) -> anyhow::Result<()> {
         private_dir(&self.dir)?;
         let tmp = self.dir.join("accounts.json.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(index)?)?;
-        fs::rename(tmp, self.index_path())?;
+        fs::write(&tmp, serde_json::to_vec_pretty(index)?)
+            .with_context(|| format!("cannot write account index {}", tmp.display()))?;
+        let index_path = self.index_path();
+        fs::rename(&tmp, &index_path)
+            .with_context(|| format!("cannot replace account index {}", index_path.display()))?;
         Ok(())
     }
 
@@ -113,9 +116,16 @@ impl Accounts {
     pub fn register(&self, staging: &Path, number: &str, aci: &str) -> anyhow::Result<()> {
         let target = self.account_dir(aci);
         if target.exists() {
-            fs::remove_dir_all(&target)?;
+            fs::remove_dir_all(&target)
+                .with_context(|| format!("cannot remove previous account directory {}", target.display()))?;
         }
-        fs::rename(staging, &target)?;
+        fs::rename(staging, &target).with_context(|| {
+            format!(
+                "cannot move linked account data from {} to {}",
+                staging.display(),
+                target.display()
+            )
+        })?;
         let mut index = self.list();
         index.retain(|_, v| v != aci);
         index.insert(number.to_string(), aci.to_string());
