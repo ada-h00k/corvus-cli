@@ -240,7 +240,7 @@ impl Daemon {
                             break;
                         }
                         Err(error) if is_signal_rate_limit(&error.message) => {
-                            let delay = receipt_retry_after(&error.message)
+                            let delay = signal_retry_after(&error.message)
                                 .unwrap_or(Duration::from_secs(60))
                                 .saturating_add(Duration::from_secs(1));
                             debug!(
@@ -666,15 +666,7 @@ impl Daemon {
             Ok(()) => info!(sender = %sender.service_id_string(), "requested a fresh Signal session after a decryption error"),
             Err(error) => {
                 let message = error.to_string();
-                let delay = if is_signal_rate_limit(&message) {
-                    // Signal often returns PT600S. If it omits a parseable hint, use ten minutes
-                    // rather than immediately hammering the sender with another session reset.
-                    receipt_retry_after(&message)
-                        .unwrap_or(Duration::from_secs(600))
-                        .saturating_add(Duration::from_secs(1))
-                } else {
-                    Duration::from_secs(60)
-                };
+                let delay = session_reset_backoff(&message);
                 let retry_ms = delay.as_millis().min(u64::MAX as u128) as u64;
                 self.decryption_reset_retry_at
                     .borrow_mut()
@@ -1148,9 +1140,21 @@ impl Daemon {
     }
 }
 
-/// Whether Signal explicitly rejected a receipt because of its rate limit.
+/// Whether Signal explicitly rejected an outbound request because of its rate limit.
 fn is_signal_rate_limit(message: &str) -> bool {
     message.contains("Rate limit exceeded")
+}
+
+/// How long to wait before attempting another session reset after a failure.
+fn session_reset_backoff(message: &str) -> Duration {
+    if is_signal_rate_limit(message) {
+        // Signal often returns PT600S. If it omits a parseable hint, use ten minutes.
+        signal_retry_after(message)
+            .unwrap_or(Duration::from_secs(600))
+            .saturating_add(Duration::from_secs(1))
+    } else {
+        Duration::from_secs(60)
+    }
 }
 
 /// Parses Signal's "retry after PT..." hint. A missing or unfamiliar format is handled by
@@ -1252,5 +1256,21 @@ mod receipt_queue_tests {
     fn detects_signal_rate_limit_messages() {
         assert!(is_signal_rate_limit("service error: Rate limit exceeded: retry after PT600S"));
         assert!(!is_signal_rate_limit("network unavailable"));
+    }
+
+    #[test]
+    fn session_reset_backoff_honors_rate_limit_cooldown() {
+        assert_eq!(
+            session_reset_backoff("Rate limit exceeded: retry after PT600S"),
+            Duration::from_secs(601)
+        );
+        assert_eq!(
+            session_reset_backoff("Rate limit exceeded"),
+            Duration::from_secs(601)
+        );
+        assert_eq!(
+            session_reset_backoff("network unavailable"),
+            Duration::from_secs(60)
+        );
     }
 }
