@@ -59,6 +59,17 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install cmake protobuf openssl@3
 
+      - name: Restore vcpkg downloads and binary cache (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            C:\vcpkg\downloads
+            ${{ runner.temp }}\vcpkg-binary-cache
+          key: vcpkg-win-x64-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            vcpkg-win-x64-
+
       - name: Install native build dependencies (Windows)
         if: runner.os == 'Windows'
         run: |
@@ -67,13 +78,73 @@ jobs:
           # Windows. Dynamic triplet: a static libcrypto would clash with the
           # BoringSSL symbols (EVP_*, SHA256, ...) already linked statically
           # via presage/libsignal.
-          vcpkg install openssl --triplet x64-windows
+          #
+          # Resilience: vcpkg pulls perl, nasm, cmake and the OpenSSL sources
+          # from GitHub Releases, which occasionally answers 504. Warm vcpkg's
+          # download dir ourselves with patient curl retries (a stale or wrong
+          # file is harmless: vcpkg hash-checks and re-downloads on mismatch),
+          # retry the install itself, and cache both downloads and built
+          # packages so one green run immunizes all later ones.
+          export VCPKG_DEFAULT_BINARY_CACHE="$RUNNER_TEMP/vcpkg-binary-cache"
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE" "$VCPKG_INSTALLATION_ROOT/downloads"
+
+          fetch() {
+            local out="$VCPKG_INSTALLATION_ROOT/downloads/$2"
+            if [ -s "$out" ]; then
+              echo "already cached: $2"
+              return 0
+            fi
+            if curl --fail --location --silent --show-error \
+                 --retry 10 --retry-delay 10 --retry-all-errors \
+                 --output "$out.part" "$1"; then
+              mv -f "$out.part" "$out"
+            else
+              echo "::warning::prefetch failed for $2, vcpkg will try its own download"
+              rm -f "$out.part"
+            fi
+          }
+          # Pinned to the versions the runner's vcpkg portfiles request today;
+          # safe against drift because vcpkg verifies hashes.
+          fetch "https://github.com/StrawberryPerl/Perl-Dist-Strawberry/releases/download/SP_54221_64bit/strawberry-perl-5.42.2.1-64bit-portable.zip" \
+                "strawberry-perl-5.42.2.1-64bit-portable.zip"
+          fetch "https://github.com/openssl/openssl/archive/openssl-3.6.5.tar.gz" \
+                "openssl-openssl-openssl-3.6.5.tar.gz"
+
+          vcpkg_ok=0
+          for attempt in 1 2 3; do
+            echo "::group::vcpkg install openssl (attempt $attempt/3)"
+            if vcpkg install openssl --triplet x64-windows; then
+              vcpkg_ok=1
+            fi
+            echo "::endgroup::"
+            if [ "$vcpkg_ok" -eq 1 ]; then
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "vcpkg attempt $attempt failed; retrying in 60 s ..."
+              sleep 60
+            fi
+          done
+          if [ "$vcpkg_ok" -ne 1 ]; then
+            echo "vcpkg install failed after 3 attempts"
+            exit 1
+          fi
+
           VCPKG_INSTALLED="$VCPKG_INSTALLATION_ROOT/installed/x64-windows"
           {
             echo "OPENSSL_DIR=$VCPKG_INSTALLED"
             echo "OPENSSL_LIB_DIR=$VCPKG_INSTALLED/lib"
             echo "OPENSSL_INCLUDE_DIR=$VCPKG_INSTALLED/include"
           } >> "$GITHUB_ENV"
+
+      - name: Save vcpkg downloads and binary cache (Windows)
+        if: always() && runner.os == 'Windows'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            C:\vcpkg\downloads
+            ${{ runner.temp }}\vcpkg-binary-cache
+          key: vcpkg-win-x64-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
