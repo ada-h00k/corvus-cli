@@ -568,7 +568,11 @@ impl Daemon {
                         let who = self.dir.borrow().get(&sid.raw_uuid()).number.unwrap_or_else(|| sid.raw_uuid().to_string());
                         return Err(RpcError::failed(identities::untrusted_error(&who)));
                     }
-                    m.send_message(*sid, body.clone(), timestamp).await?;
+                    self.wait_for_outbound_slot().await?;
+                    let send_result = m.send_message(*sid, body.clone(), timestamp).await;
+                    let error_message = send_result.as_ref().err().map(ToString::to_string);
+                    self.record_outbound_result(error_message.as_deref());
+                    send_result?;
                     results.push(json!({"recipientAddress": self.address_json(sid), "type": "SUCCESS"}));
                 }
                 Target::Group(key) => {
@@ -590,7 +594,11 @@ impl Daemon {
                             untrusted.push(*aci);
                         }
                     }
-                    m.send_message_to_group_except(key, body, timestamp, &untrusted).await?;
+                    self.wait_for_outbound_slot().await?;
+                    let send_result = m.send_message_to_group_except(key, body, timestamp, &untrusted).await;
+                    let error_message = send_result.as_ref().err().map(ToString::to_string);
+                    self.record_outbound_result(error_message.as_deref());
+                    send_result?;
                     for aci in members {
                         let sid = ServiceId::Aci(aci);
                         let kind = if untrusted.contains(&aci) { "IDENTITY_FAILURE" } else { "SUCCESS" };
