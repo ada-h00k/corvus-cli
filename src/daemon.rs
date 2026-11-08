@@ -316,15 +316,15 @@ impl Daemon {
 
     /// How long Signal's global outbound cooldown still has to run, if any.
     fn outbound_cooldown_remaining(&self) -> Option<Duration> {
-        self.outbound_blocked_until
-            .borrow()
-            .and_then(|until| until.checked_duration_since(tokio::time::Instant::now()))
+        let now = tokio::time::Instant::now();
+        let until = *self.outbound_blocked_until.borrow();
+        until.and_then(|until| (until > now).then_some(until - now))
     }
 
     /// Fail locally while Signal has an active cooldown; otherwise space outbound requests.
     async fn wait_for_outbound_slot(&self) -> Result<(), RpcError> {
         if let Some(remaining) = self.outbound_cooldown_remaining() {
-            let seconds = remaining.as_secs().saturating_add(u64::from(remaining.subsec_nanos() > 0));
+            let seconds = remaining.as_secs().saturating_add(if remaining.subsec_nanos() > 0 { 1 } else { 0 });
             return Err(RpcError::failed(format!(
                 "Rate limit exceeded: retry after PT{seconds}S (locally paused; no request sent)"
             )));
