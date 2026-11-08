@@ -819,7 +819,22 @@ impl Daemon {
                 Target::Group(key) => {
                     let id = envelope::group_id(&key).and_then(|id| BASE64_STANDARD.decode(id).ok());
                     let typing = TypingMessage { timestamp: Some(timestamp), action: Some(action as i32), group_id: id };
-                    m.send_message_to_group(&key, ContentBody::TypingMessage(typing), timestamp).await?;
+                    // Typing has no sent transcript to sync, but send_message_to_group
+                    // tries to build one for a multi-device account and logs an error
+                    // when there is none (libsignal-service sender.rs). Send to the
+                    // members directly instead, like the group fan-out does internally;
+                    // a group unknown to the store keeps the old call (it resolves the
+                    // members from the server).
+                    match self.store().group(key).await? {
+                        Some(group) => {
+                            for aci in group.members.iter().map(|m| m.aci).filter(|a| Uuid::from(*a) != self.self_aci) {
+                                if let Err(e) = m.send_message(ServiceId::Aci(aci), ContentBody::TypingMessage(typing.clone()), timestamp).await {
+                                    warn!(%e, "cannot send a typing notification");
+                                }
+                            }
+                        }
+                        None => m.send_message_to_group(&key, ContentBody::TypingMessage(typing), timestamp).await?,
+                    }
                 }
             }
         }
