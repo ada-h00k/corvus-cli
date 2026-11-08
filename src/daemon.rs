@@ -64,6 +64,12 @@ struct ReceiptRequest {
     response: Option<oneshot::Sender<RpcResult>>,
 }
 
+#[derive(Default)]
+struct TypingState {
+    active: bool,
+    last_sent: Option<tokio::time::Instant>,
+}
+
 pub struct Daemon {
     pub(crate) manager: Mgr,
     out: mpsc::UnboundedSender<Output>,
@@ -83,6 +89,11 @@ pub struct Daemon {
     receipt_rx: RefCell<Option<mpsc::UnboundedReceiver<ReceiptRequest>>>,
     /// Recent successful receipts, keyed by recipient and type, to avoid resending timestamps.
     receipt_history: RefCell<HashMap<(String, i32), VecDeque<u64>>>,
+    /// Enforce a minimum gap and a global server-imposed cooldown for every outbound request.
+    outbound_last_send: RefCell<Option<tokio::time::Instant>>,
+    outbound_blocked_until: RefCell<Option<tokio::time::Instant>>,
+    /// Coalesce repeated typing notifications by conversation.
+    typing_state: RefCell<HashMap<String, TypingState>>,
     /// Next allowed session-reset attempt per sender (Unix milliseconds).
     decryption_reset_retry_at: RefCell<HashMap<Uuid, u64>>,
     /// Sticker pack downloads are serialised: every storage change triggers a sync, and two of
@@ -125,6 +136,9 @@ impl Daemon {
             receipt_tx,
             receipt_rx: RefCell::new(Some(receipt_rx)),
             receipt_history: Default::default(),
+            outbound_last_send: Default::default(),
+            outbound_blocked_until: Default::default(),
+            typing_state: Default::default(),
             decryption_reset_retry_at: Default::default(),
             pack_sync: Mutex::new(()),
         });
@@ -241,7 +255,7 @@ impl Daemon {
                         }
                         Err(error) if is_signal_rate_limit(&error.message) => {
                             let delay = signal_retry_after(&error.message)
-                                .unwrap_or(Duration::from_secs(60))
+                                .unwrap_or(Duration::from_secs(600))
                                 .saturating_add(Duration::from_secs(1));
                             debug!(
                                 recipient = %recipient.service_id_string(),
@@ -297,6 +311,76 @@ impl Daemon {
             .is_err()
         {
             debug!("receipt queue is unavailable; cannot queue delivery receipt");
+        }
+    }
+
+    /// How long Signal's global outbound cooldown still has to run, if any.
+    fn outbound_cooldown_remaining(&self) -> Option<Duration> {
+        let now = tokio::time::Instant::now();
+        let until = *self.outbound_blocked_until.borrow();
+        until.and_then(|until| (until > now).then_some(until - now))
+    }
+
+    /// Fail locally while Signal has an active cooldown; otherwise space outbound requests.
+    async fn wait_for_outbound_slot(&self) -> Result<(), RpcError> {
+        if let Some(remaining) = self.outbound_cooldown_remaining() {
+            let seconds = remaining.as_secs().saturating_add(if remaining.subsec_nanos() > 0 { 1 } else { 0 });
+            return Err(RpcError::failed(format!(
+                "Rate limit exceeded: retry after PT{seconds}S (locally paused; no request sent)"
+            )));
+        }
+
+        let last_send = *self.outbound_last_send.borrow();
+        if let Some(last) = last_send {
+            let next = last + Duration::from_secs(1);
+            if next > tokio::time::Instant::now() {
+                tokio::time::sleep_until(next).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remember that a request went out and install a process-wide cooldown on a server limit.
+    fn record_outbound_result(&self, error: Option<&str>) {
+        let now = tokio::time::Instant::now();
+        *self.outbound_last_send.borrow_mut() = Some(now);
+        let Some(message) = error.filter(|message| is_signal_rate_limit(message)) else { return };
+
+        let delay = signal_retry_after(message)
+            .unwrap_or(Duration::from_secs(600))
+            .saturating_add(Duration::from_secs(1));
+        let until = now + delay;
+        let mut blocked_until = self.outbound_blocked_until.borrow_mut();
+        if blocked_until.is_none_or(|current| current < until) {
+            *blocked_until = Some(until);
+        }
+        warn!(
+            retry_after_seconds = delay.as_secs(),
+            "Signal rate-limited an outbound request; pausing all outbound sends"
+        );
+    }
+
+    /// Return true only for a useful typing state transition or a periodic refresh.
+    fn should_send_typing(&self, key: String, started: bool) -> bool {
+        const REFRESH_INTERVAL: Duration = Duration::from_secs(8);
+        let now = tokio::time::Instant::now();
+        let mut states = self.typing_state.borrow_mut();
+        let state = states.entry(key).or_default();
+        if started {
+            if state.active
+                && state.last_sent.is_some_and(|last| now.duration_since(last) < REFRESH_INTERVAL)
+            {
+                return false;
+            }
+            state.active = true;
+            state.last_sent = Some(now);
+            true
+        } else if state.active {
+            state.active = false;
+            state.last_sent = Some(now);
+            true
+        } else {
+            false
         }
     }
 
@@ -485,7 +569,11 @@ impl Daemon {
                         let who = self.dir.borrow().get(&sid.raw_uuid()).number.unwrap_or_else(|| sid.raw_uuid().to_string());
                         return Err(RpcError::failed(identities::untrusted_error(&who)));
                     }
-                    m.send_message(*sid, body.clone(), timestamp).await?;
+                    self.wait_for_outbound_slot().await?;
+                    let send_result = m.send_message(*sid, body.clone(), timestamp).await;
+                    let error_message = send_result.as_ref().err().map(ToString::to_string);
+                    self.record_outbound_result(error_message.as_deref());
+                    send_result?;
                     results.push(json!({"recipientAddress": self.address_json(sid), "type": "SUCCESS"}));
                 }
                 Target::Group(key) => {
@@ -507,7 +595,11 @@ impl Daemon {
                             untrusted.push(*aci);
                         }
                     }
-                    m.send_message_to_group_except(key, body, timestamp, &untrusted).await?;
+                    self.wait_for_outbound_slot().await?;
+                    let send_result = m.send_message_to_group_except(key, body, timestamp, &untrusted).await;
+                    let error_message = send_result.as_ref().err().map(ToString::to_string);
+                    self.record_outbound_result(error_message.as_deref());
+                    send_result?;
                     for aci in members {
                         let sid = ServiceId::Aci(aci);
                         let kind = if untrusted.contains(&aci) { "IDENTITY_FAILURE" } else { "SUCCESS" };
@@ -661,8 +753,28 @@ impl Daemon {
             retry_at.insert(uuid, timestamp.saturating_add(COOLDOWN_MS));
         }
 
+        let _guard = self.send_lock.lock().await;
+        if let Some(remaining) = self.outbound_cooldown_remaining() {
+            let retry_ms = remaining.as_millis().min(u64::MAX as u128) as u64;
+            self.decryption_reset_retry_at
+                .borrow_mut()
+                .insert(uuid, timestamp.saturating_add(retry_ms));
+            debug!(
+                sender = %sender.service_id_string(),
+                retry_after_seconds = remaining.as_secs(),
+                "skipping session reset while Signal outbound sending is rate-limited"
+            );
+            return;
+        }
+        if self.wait_for_outbound_slot().await.is_err() {
+            return;
+        }
+
         let mut manager = self.manager.clone();
-        match manager.send_session_reset(&sender, timestamp).await {
+        let reset_result = manager.send_session_reset(&sender, timestamp).await;
+        let error_message = reset_result.as_ref().err().map(ToString::to_string);
+        self.record_outbound_result(error_message.as_deref());
+        match reset_result {
             Ok(()) => info!(sender = %sender.service_id_string(), "requested a fresh Signal session after a decryption error"),
             Err(error) => {
                 let message = error.to_string();
@@ -1051,16 +1163,44 @@ impl Daemon {
 
     async fn send_typing(&self, p: &Params) -> RpcResult {
         let timestamp = now_ms();
-        let action = if p.bool("stop") { Action::Stopped } else { Action::Started };
+        let started = !p.bool("stop");
+        let action = if started { Action::Started } else { Action::Stopped };
         let _guard = self.send_lock.lock().await;
         for target in self.targets(p).await? {
             let mut m = self.manager.clone();
             match target {
                 Target::Contact(sid) => {
+                    // Typing indicators are ephemeral. Never queue them behind a server cooldown.
+                    if self.outbound_cooldown_remaining().is_some() {
+                        debug!("dropping typing indicator while Signal outbound sending is rate-limited");
+                        continue;
+                    }
+                    let typing_key = format!("contact:{}", sid.service_id_string());
+                    if !self.should_send_typing(typing_key, started) {
+                        continue;
+                    }
+                    self.wait_for_outbound_slot().await?;
                     let typing = TypingMessage { timestamp: Some(timestamp), action: Some(action as i32), group_id: None };
-                    m.send_message(sid, ContentBody::TypingMessage(typing), timestamp).await?;
+                    let send_result = m.send_message(sid, ContentBody::TypingMessage(typing), timestamp).await;
+                    let error_message = send_result.as_ref().err().map(ToString::to_string);
+                    self.record_outbound_result(error_message.as_deref());
+                    if let Err(error) = send_result {
+                        if error_message.as_deref().is_some_and(is_signal_rate_limit) {
+                            debug!(%error, "Signal rate-limited a typing indicator; dropping it");
+                            return Ok(json!({"timestamp": timestamp, "results": []}));
+                        }
+                        return Err(error.into());
+                    }
                 }
                 Target::Group(key) => {
+                    if self.outbound_cooldown_remaining().is_some() {
+                        debug!("dropping group typing indicator while Signal outbound sending is rate-limited");
+                        continue;
+                    }
+                    let typing_key = format!("group:{}", BASE64_STANDARD.encode(key));
+                    if !self.should_send_typing(typing_key, started) {
+                        continue;
+                    }
                     let id = envelope::group_id(&key).and_then(|id| BASE64_STANDARD.decode(id).ok());
                     let typing = TypingMessage { timestamp: Some(timestamp), action: Some(action as i32), group_id: id };
                     // Typing has no sent transcript to sync, but send_message_to_group
@@ -1072,12 +1212,36 @@ impl Daemon {
                     match self.store().group(key).await? {
                         Some(group) => {
                             for aci in group.members.iter().map(|m| m.aci).filter(|a| Uuid::from(*a) != self.self_aci) {
-                                if let Err(e) = m.send_message(ServiceId::Aci(aci), ContentBody::TypingMessage(typing.clone()), timestamp).await {
-                                    warn!(%e, "cannot send a typing notification");
+                                if self.outbound_cooldown_remaining().is_some() {
+                                    debug!("stopping group typing fan-out because Signal outbound sending is rate-limited");
+                                    break;
+                                }
+                                self.wait_for_outbound_slot().await?;
+                                let result = m.send_message(ServiceId::Aci(aci), ContentBody::TypingMessage(typing.clone()), timestamp).await;
+                                let error_message = result.as_ref().err().map(ToString::to_string);
+                                self.record_outbound_result(error_message.as_deref());
+                                if let Err(error) = result {
+                                    if error_message.as_deref().is_some_and(is_signal_rate_limit) {
+                                        debug!(%error, "Signal rate-limited a group typing indicator; stopping fan-out");
+                                        break;
+                                    }
+                                    warn!(%error, "cannot send a typing notification");
                                 }
                             }
                         }
-                        None => m.send_message_to_group(&key, ContentBody::TypingMessage(typing), timestamp).await?,
+                        None => {
+                            self.wait_for_outbound_slot().await?;
+                            let result = m.send_message_to_group(&key, ContentBody::TypingMessage(typing), timestamp).await;
+                            let error_message = result.as_ref().err().map(ToString::to_string);
+                            self.record_outbound_result(error_message.as_deref());
+                            if let Err(error) = result {
+                                if error_message.as_deref().is_some_and(is_signal_rate_limit) {
+                                    debug!(%error, "Signal rate-limited a group typing indicator; dropping it");
+                                    return Ok(json!({"timestamp": timestamp, "results": []}));
+                                }
+                                return Err(error.into());
+                            }
+                        }
                     }
                 }
             }
