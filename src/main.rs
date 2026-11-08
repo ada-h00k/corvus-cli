@@ -311,10 +311,10 @@ mod tests {
             drop(tx);
 
             let mut bytes = Vec::new();
-            let (write_result, read_result) = tokio::join!(write_output(rx, writer), reader.read_to_end(&mut bytes));
+            let (write_result, read_result) = futures::future::join(write_output(rx, writer), reader.read_to_end(&mut bytes)).await;
             write_result.unwrap();
             read_result.unwrap();
-            assert_eq!(bytes, b"{\\"method\\":\\"receive\\"}\n");
+            assert_eq!(bytes, [br#"{"method":"receive"}"#.as_slice(), b"\n"].concat());
             assert!(matches!(confirmed_rx.await, Ok(Ok(()))));
         });
     }
