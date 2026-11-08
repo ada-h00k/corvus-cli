@@ -436,7 +436,11 @@ impl Daemon {
                                 self.clone().refresh_storage().await;
                             }
                             Received::DecryptionError(sender) => {
-                                warn!(sender = %sender.service_id_string(), "cannot decrypt a message");
+                                // Some undecryptable envelopes can coexist with successfully
+                                // delivered messages. Keep this diagnostic out of Corvus'
+                                // user-facing warning area; a failed recovery is still warned
+                                // about by recover_decryption_error().
+                                debug!(sender = %sender.service_id_string(), "cannot decrypt an incoming envelope; attempting session recovery");
                                 self.recover_decryption_error(sender).await;
                             }
                             Received::Content(content) => {
