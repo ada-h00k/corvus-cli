@@ -25,7 +25,7 @@ use presage::libsignal_service::prelude::Uuid;
 use presage::manager::Registered;
 use presage::Manager;
 use presage_store_sqlite::SqliteStore;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 
@@ -208,15 +208,11 @@ async fn json_rpc(accounts: &Accounts, account: &str) -> anyhow::Result<()> {
         .await
         .context("account is not linked (link it again)")?;
 
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<daemon::Output>();
     let writer = tokio::task::spawn_local(async move {
-        let mut stdout = tokio::io::stdout();
-        while let Some(value) = out_rx.recv().await {
-            let mut line = value.to_string();
-            line.push('\n');
-            if stdout.write_all(line.as_bytes()).await.is_err() || stdout.flush().await.is_err() {
-                break;
-            }
+        if let Err(e) = write_output(out_rx, tokio::io::stdout()).await {
+            error!(%e, "stdout write failed; exiting to avoid silently dropping incoming Signal messages");
+            std::process::exit(1);
         }
     });
 
@@ -238,7 +234,7 @@ async fn json_rpc(accounts: &Accounts, account: &str) -> anyhow::Result<()> {
         let request = match rpc::parse_request(&line) {
             Ok(request) => request,
             Err(response) => {
-                let _ = out_tx.send(response);
+                let _ = out_tx.send(daemon::Output::queued(response));
                 continue;
             }
         };
@@ -255,7 +251,7 @@ async fn json_rpc(accounts: &Accounts, account: &str) -> anyhow::Result<()> {
                 }
             }
             if let Some(id) = request.id {
-                let _ = out.send(rpc::response(id, result));
+                let _ = out.send(daemon::Output::queued(rpc::response(id, result)));
             }
         });
     }
@@ -266,12 +262,80 @@ async fn json_rpc(accounts: &Accounts, account: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Writes one JSON-RPC line at a time and confirms tracked notifications only after flush.
+async fn write_output<W>(
+    mut out_rx: mpsc::UnboundedReceiver<daemon::Output>,
+    mut stdout: W,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    while let Some(output) = out_rx.recv().await {
+        let mut line = output.value.to_string();
+        line.push('\n');
+        let result = async {
+            stdout.write_all(line.as_bytes()).await?;
+            stdout.flush().await
+        }
+        .await;
+
+        if let Some(written) = output.written {
+            let confirmation = result.as_ref().map(|_| ()).map_err(ToString::to_string);
+            let _ = written.send(confirmation);
+        }
+        result?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     fn args(list: &[&str]) -> Args {
         parse_args(list.iter().map(|s| s.to_string())).unwrap()
+    }
+
+    #[test]
+    fn output_writer_confirms_a_notification_after_writing_it() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let (confirmed_tx, confirmed_rx) = tokio::sync::oneshot::channel();
+            let (mut reader, writer) = tokio::io::duplex(128);
+            tx.send(daemon::Output {
+                value: serde_json::json!({"method": "receive"}),
+                written: Some(confirmed_tx),
+            }).unwrap();
+            drop(tx);
+
+            let mut bytes = Vec::new();
+            let (write_result, read_result) = futures::future::join(write_output(rx, writer), reader.read_to_end(&mut bytes)).await;
+            write_result.unwrap();
+            read_result.unwrap();
+            assert_eq!(bytes, [br#"{"method":"receive"}"#.as_slice(), b"\n"].concat());
+            assert!(matches!(confirmed_rx.await, Ok(Ok(()))));
+        });
+    }
+
+    #[test]
+    fn output_writer_reports_a_broken_pipe_to_the_receiver() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let (confirmed_tx, confirmed_rx) = tokio::sync::oneshot::channel();
+            let (reader, writer) = tokio::io::duplex(64);
+            drop(reader);
+            tx.send(daemon::Output {
+                value: serde_json::json!({"method": "receive"}),
+                written: Some(confirmed_tx),
+            }).unwrap();
+            drop(tx);
+
+            assert!(write_output(rx, writer).await.is_err());
+            assert!(matches!(confirmed_rx.await, Ok(Err(_))));
+        });
     }
 
     #[test]
