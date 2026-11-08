@@ -32,6 +32,22 @@ use tracing::{debug, error, warn};
 use crate::store::{e164, open_store, Accounts};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Commit of the build, for Corvus' update check (releases are tagged "commit-<sha>"). Set by CI
+/// (GITHUB_SHA) or by hand (CORVUS_CLI_COMMIT) when building; absent in local builds.
+const BUILD_COMMIT: Option<&str> = match option_env!("CORVUS_CLI_COMMIT") {
+    Some(c) => Some(c),
+    None => option_env!("GITHUB_SHA"),
+};
+
+/// "0.1.0" or "0.1.0 (4d76022)".
+fn version_text() -> String {
+    match BUILD_COMMIT {
+        Some(c) if c.len() >= 7 && c.chars().all(|ch| ch.is_ascii_hexdigit()) => {
+            format!("{VERSION} ({})", &c[..7].to_ascii_lowercase())
+        }
+        _ => VERSION.to_string(),
+    }
+}
 /// The signal-cli version whose interface is implemented. Corvus gates features on the last word of
 /// `--version`, so this is printed last.
 const COMPAT_VERSION: &str = "0.14.9";
@@ -120,7 +136,7 @@ fn main() -> ExitCode {
     };
     init_logging(args.verbosity);
     if args.version {
-        println!("corvus-cli {VERSION} compatible with signal-cli {COMPAT_VERSION}");
+        println!("corvus-cli {} compatible with signal-cli {COMPAT_VERSION}", version_text());
         return ExitCode::SUCCESS;
     }
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
