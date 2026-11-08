@@ -83,8 +83,8 @@ pub struct Daemon {
     receipt_rx: RefCell<Option<mpsc::UnboundedReceiver<ReceiptRequest>>>,
     /// Recent successful receipts, keyed by recipient and type, to avoid resending timestamps.
     receipt_history: RefCell<HashMap<(String, i32), VecDeque<u64>>>,
-    /// Avoid repeatedly resetting a peer while its messages fail to decrypt.
-    decryption_resets: RefCell<HashMap<Uuid, u64>>,
+    /// Next allowed session-reset attempt per sender (Unix milliseconds).
+    decryption_reset_retry_at: RefCell<HashMap<Uuid, u64>>,
     /// Sticker pack downloads are serialised: every storage change triggers a sync, and two of
     /// them would download the same packs twice.
     pub(crate) pack_sync: Mutex<()>,
@@ -125,7 +125,7 @@ impl Daemon {
             receipt_tx,
             receipt_rx: RefCell::new(Some(receipt_rx)),
             receipt_history: Default::default(),
-            decryption_resets: Default::default(),
+            decryption_reset_retry_at: Default::default(),
             pack_sync: Mutex::new(()),
         });
         daemon.reload_directory().await;
@@ -239,7 +239,7 @@ impl Daemon {
                             }
                             break;
                         }
-                        Err(error) if is_receipt_rate_limit(&error.message) => {
+                        Err(error) if is_signal_rate_limit(&error.message) => {
                             let delay = receipt_retry_after(&error.message)
                                 .unwrap_or(Duration::from_secs(60))
                                 .saturating_add(Duration::from_secs(1));
@@ -653,23 +653,38 @@ impl Daemon {
         const COOLDOWN_MS: u64 = 60_000;
 
         {
-            let mut resets = self.decryption_resets.borrow_mut();
-            if resets
-                .get(&uuid)
-                .is_some_and(|last| timestamp.saturating_sub(*last) < COOLDOWN_MS)
-            {
+            let mut retry_at = self.decryption_reset_retry_at.borrow_mut();
+            if retry_at.get(&uuid).is_some_and(|until| timestamp < *until) {
                 debug!(sender = %sender.service_id_string(), "session reset is cooling down after a decryption error");
                 return;
             }
-            resets.insert(uuid, timestamp);
+            retry_at.insert(uuid, timestamp.saturating_add(COOLDOWN_MS));
         }
 
         let mut manager = self.manager.clone();
         match manager.send_session_reset(&sender, timestamp).await {
             Ok(()) => info!(sender = %sender.service_id_string(), "requested a fresh Signal session after a decryption error"),
             Err(error) => {
-                self.decryption_resets.borrow_mut().remove(&uuid);
-                warn!(%error, sender = %sender.service_id_string(), "could not reset the Signal session after a decryption error");
+                let message = error.to_string();
+                let delay = if is_signal_rate_limit(&message) {
+                    // Signal often returns PT600S. If it omits a parseable hint, use ten minutes
+                    // rather than immediately hammering the sender with another session reset.
+                    receipt_retry_after(&message)
+                        .unwrap_or(Duration::from_secs(600))
+                        .saturating_add(Duration::from_secs(1))
+                } else {
+                    Duration::from_secs(60)
+                };
+                let retry_ms = delay.as_millis().min(u64::MAX as u128) as u64;
+                self.decryption_reset_retry_at
+                    .borrow_mut()
+                    .insert(uuid, now_ms().saturating_add(retry_ms));
+                warn!(
+                    %error,
+                    sender = %sender.service_id_string(),
+                    retry_after_seconds = delay.as_secs(),
+                    "could not reset the Signal session after a decryption error; retry is delayed"
+                );
             }
         }
     }
@@ -1134,7 +1149,7 @@ impl Daemon {
 }
 
 /// Whether Signal explicitly rejected a receipt because of its rate limit.
-fn is_receipt_rate_limit(message: &str) -> bool {
+fn is_signal_rate_limit(message: &str) -> bool {
     message.contains("Rate limit exceeded")
 }
 
@@ -1234,8 +1249,8 @@ mod receipt_queue_tests {
     }
 
     #[test]
-    fn detects_only_the_signal_receipt_rate_limit_message() {
-        assert!(is_receipt_rate_limit("service error: Rate limit exceeded: retry after PT600S"));
-        assert!(!is_receipt_rate_limit("network unavailable"));
+    fn detects_signal_rate_limit_messages() {
+        assert!(is_signal_rate_limit("service error: Rate limit exceeded: retry after PT600S"));
+        assert!(!is_signal_rate_limit("network unavailable"));
     }
 }
