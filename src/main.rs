@@ -225,6 +225,7 @@ async fn json_rpc(accounts: &Accounts, account: &str) -> anyhow::Result<()> {
     });
 
     let daemon = daemon::Daemon::new(manager, &dir, out_tx.clone()).await?;
+    daemon.start_receipt_worker();
     // Contacts' numbers and names come from the storage service: read it before the first
     // listContacts is answered (requests wait in stdin meanwhile), but not for ever.
     if tokio::time::timeout(std::time::Duration::from_secs(10), daemon.clone().refresh_storage()).await.is_err() {
