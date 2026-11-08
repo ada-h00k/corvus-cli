@@ -1170,13 +1170,13 @@ impl Daemon {
             let mut m = self.manager.clone();
             match target {
                 Target::Contact(sid) => {
-                    let typing_key = format!("contact:{}", sid.service_id_string());
-                    if !self.should_send_typing(typing_key, started) {
-                        continue;
-                    }
                     // Typing indicators are ephemeral. Never queue them behind a server cooldown.
                     if self.outbound_cooldown_remaining().is_some() {
                         debug!("dropping typing indicator while Signal outbound sending is rate-limited");
+                        continue;
+                    }
+                    let typing_key = format!("contact:{}", sid.service_id_string());
+                    if !self.should_send_typing(typing_key, started) {
                         continue;
                     }
                     self.wait_for_outbound_slot().await?;
@@ -1193,12 +1193,12 @@ impl Daemon {
                     }
                 }
                 Target::Group(key) => {
-                    let typing_key = format!("group:{}", BASE64_STANDARD.encode(key));
-                    if !self.should_send_typing(typing_key, started) {
-                        continue;
-                    }
                     if self.outbound_cooldown_remaining().is_some() {
                         debug!("dropping group typing indicator while Signal outbound sending is rate-limited");
+                        continue;
+                    }
+                    let typing_key = format!("group:{}", BASE64_STANDARD.encode(key));
+                    if !self.should_send_typing(typing_key, started) {
                         continue;
                     }
                     let id = envelope::group_id(&key).and_then(|id| BASE64_STANDARD.decode(id).ok());
