@@ -47,6 +47,14 @@ struct Args {
     rest: Vec<String>,
 }
 
+/// Expected server throttling for read/delivery receipts is not an application failure.
+fn should_log_rpc_error(method: &str, message: &str) -> bool {
+    let expected_avatar_miss = method == "getAvatar" && message == "No avatar found";
+    let expected_receipt_rate_limit =
+        method == "sendReceipt" && message.contains("Rate limit exceeded");
+    !expected_avatar_miss && !expected_receipt_rate_limit
+}
+
 fn parse_args(argv: impl IntoIterator<Item = String>) -> anyhow::Result<Args> {
     let mut args = Args::default();
     let mut it = argv.into_iter();
@@ -245,9 +253,10 @@ async fn json_rpc(accounts: &Accounts, account: &str) -> anyhow::Result<()> {
             if let Err(e) = &result {
                 // Missing avatars are normal: Corvus tries the contact avatar first, then
                 // the profile avatar, and finally falls back to its generated placeholder.
-                let expected_avatar_miss = request.method == "getAvatar" && e.message == "No avatar found";
-                if !expected_avatar_miss {
+                if should_log_rpc_error(&request.method, &e.message) {
                     error!(method = request.method, error = e.message, "call failed");
+                } else if request.method == "sendReceipt" {
+                    debug!(method = request.method, error = e.message, "Signal temporarily rate-limited a receipt; the receipt was not sent");
                 }
             }
             if let Some(id) = request.id {
@@ -336,6 +345,17 @@ mod tests {
             assert!(write_output(rx, writer).await.is_err());
             assert!(matches!(confirmed_rx.await, Ok(Err(_))));
         });
+    }
+
+    #[test]
+    fn expected_receipt_rate_limits_are_not_logged_as_application_errors() {
+        assert!(!should_log_rpc_error(
+            "sendReceipt",
+            "libsignal-service sending error: service error: Rate limit exceeded: retry after PT600S",
+        ));
+        assert!(should_log_rpc_error("send", "Rate limit exceeded"));
+        assert!(!should_log_rpc_error("getAvatar", "No avatar found"));
+        assert!(should_log_rpc_error("getAvatar", "network unavailable"));
     }
 
     #[test]
