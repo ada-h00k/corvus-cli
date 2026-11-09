@@ -655,7 +655,7 @@ dependencies = [
  "mime_guess",
  "presage",
  "presage-store-sqlite",
- "rand 0.9.5",
+ "rand 0.10.2",
  "serde_json",
  "tokio",
  "tracing",
