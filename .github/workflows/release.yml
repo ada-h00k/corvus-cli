@@ -61,7 +61,7 @@ jobs:
 
       - name: Restore vcpkg downloads and binary cache (Windows)
         if: runner.os == 'Windows'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             C:\vcpkg\downloads
@@ -139,7 +139,7 @@ jobs:
 
       - name: Save vcpkg downloads and binary cache (Windows)
         if: always() && runner.os == 'Windows'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             C:\vcpkg\downloads
