@@ -10,8 +10,8 @@ permissions:
   contents: write
 
 jobs:
-  build-and-release:
-    name: Build ${{ matrix.target }} and publish release
+  build:
+    name: Build ${{ matrix.target }}
     strategy:
       # One platform failing must not cancel the builds of the others.
       fail-fast: false
@@ -177,6 +177,25 @@ jobs:
           cp "$VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/"libcrypto*.dll dist/
           (cd dist && 7z a -tzip "../${{ matrix.asset }}" .)
 
+      - name: Upload release asset
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ matrix.asset }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
@@ -187,7 +206,7 @@ jobs:
             Automated stable build for commit ${{ github.sha }}.
 
             Source branch: ${{ github.ref_name }}
-          files: ${{ matrix.asset }}
+          files: release-assets/*
           fail_on_unmatched_files: true
           generate_release_notes: true
           prerelease: false
