@@ -276,6 +276,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -649,7 +655,7 @@ name = "corvus-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64",
+ "base64 0.23.1",
  "chrono",
  "futures",
  "mime_guess",
@@ -1655,7 +1661,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -2172,7 +2178,7 @@ dependencies = [
  "assert_matches",
  "async-trait",
  "attest",
- "base64",
+ "base64 0.22.1",
  "bincode",
  "boring",
  "bytes",
@@ -2236,7 +2242,7 @@ dependencies = [
  "async-trait",
  "attest",
  "auto_enums",
- "base64",
+ "base64 0.22.1",
  "bitstream-io",
  "boring",
  "bytes",
@@ -2325,7 +2331,7 @@ dependencies = [
  "aes 0.9.1",
  "aes-gcm",
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "bincode",
  "bytes",
  "cbc 0.2.1",
@@ -2918,7 +2924,7 @@ name = "presage"
 version = "0.8.0-dev"
 source = "git+https://github.com/cyberneticangel/presage?rev=f0dcc9e1c446bf7117ee6483f1af4454c795c66e#f0dcc9e1c446bf7117ee6483f1af4454c795c66e"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "derive_more",
@@ -3349,7 +3355,7 @@ version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-core",
  "futures-util",
@@ -3926,7 +3932,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05b44e85bf579a8eeb4ceaa77a3a523baf2bf0e9bac7e40f405d537b5d2d5ccb"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "cfg-if",
  "crc",
@@ -4028,7 +4034,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "87a2bdd6e83f6b3ea525ca9fee568030508b58355a43d0b2c1674d5f79dcd65e"
 dependencies = [
  "atoi",
- "base64",
+ "base64 0.22.1",
  "bitflags",
  "byteorder",
  "crc",
@@ -4471,7 +4477,7 @@ version = "0.14.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd1fa9b1a51188f3266a823208078315811269d06d272c3a61be0b9a194194ff"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "http",
  "http-body",
