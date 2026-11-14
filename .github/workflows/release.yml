@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - "**"
+    tags:
+      - 'v*.*.*'
   workflow_dispatch:
 
 permissions:
@@ -188,7 +190,7 @@ jobs:
   publish-release:
     name: Publish GitHub release
     needs: build
-    if: github.ref == 'refs/heads/main'
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
       - name: Download release assets
@@ -200,13 +202,12 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: commit-${{ github.sha }}
-          target_commitish: ${{ github.sha }}
-          name: corvus-cli ${{ github.sha }}
+          tag_name: ${{ github.ref_name }}
+          name: corvus-cli ${{ github.ref_name }}
           body: |
-            Automated stable build for commit ${{ github.sha }}.
+            corvus-cli version ${{ github.ref_name }}.
 
-            Source branch: ${{ github.ref_name }}
+            Commit: ${{ github.sha }}
           files: release-assets/*
           fail_on_unmatched_files: true
           generate_release_notes: true
