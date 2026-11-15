@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "corvus-cli"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3879,7 +3879,7 @@ dependencies = [
 [[package]]
 name = "spqr"
 version = "1.5.3"
-source = "git+https://github.com/signalapp/SparsePostQuantumRatchet.git?tag=v1.5.3#fd320484dcec89004021e6fdc7481825f5f261fa"
+source = "git+https://github.com/signalapp/sparsepostquantumratchet?tag=v1.5.3#fd320484dcec89004021e6fdc7481825f5f261fa"
 dependencies = [
  "cpufeatures 0.3.0",
  "curve25519-dalek",
