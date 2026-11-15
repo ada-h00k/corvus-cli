@@ -17,8 +17,8 @@ path = "src/main.rs"
 # lock that serialises session state between sending and receiving (sessions overwritten by a
 # concurrent send made incoming messages fail with "invalid Whisper message: decryption failed").
 # cdsi: contact discovery, to find a phone number nobody synced (libsignal-net, BoringSSL)
-presage = { git = "https://github.com/cyberneticangel/presage", rev = "f0dcc9e1c446bf7117ee6483f1af4454c795c66e", features = ["cdsi"] }
-presage-store-sqlite = { git = "https://github.com/cyberneticangel/presage", rev = "f0dcc9e1c446bf7117ee6483f1af4454c795c66e", features = ["cdsi"] }
+presage = { git = "https://github.com/ada-h00k/presage", rev = "db478944ff25ab79cf679b663a55a83f9d80b220", features = ["cdsi"] }
+presage-store-sqlite = { git = "https://github.com/ada-h00k/presage", rev = "db478944ff25ab79cf679b663a55a83f9d80b220", features = ["cdsi"] }
 
 anyhow = "1.0"
 base64 = "0.23"
