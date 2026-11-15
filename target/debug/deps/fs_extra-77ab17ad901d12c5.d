@@ -1,0 +1,10 @@
+/run/host/var/home/user/Projekte/corvus-cli/target/debug/deps/fs_extra-77ab17ad901d12c5.d: /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs_extra-1.3.0/src/lib.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs_extra-1.3.0/src/error.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs_extra-1.3.0/src/file.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs_extra-1.3.0/src/dir.rs
+
+/run/host/var/home/user/Projekte/corvus-cli/target/debug/deps/libfs_extra-77ab17ad901d12c5.rlib: /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs_extra-1.3.0/src/lib.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs_extra-1.3.0/src/error.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs_extra-1.3.0/src/file.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs_extra-1.3.0/src/dir.rs
+
+/run/host/var/home/user/Projekte/corvus-cli/target/debug/deps/libfs_extra-77ab17ad901d12c5.rmeta: /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs_extra-1.3.0/src/lib.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs_extra-1.3.0/src/error.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs_extra-1.3.0/src/file.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs_extra-1.3.0/src/dir.rs
+
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs_extra-1.3.0/src/lib.rs:
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs_extra-1.3.0/src/error.rs:
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs_extra-1.3.0/src/file.rs:
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs_extra-1.3.0/src/dir.rs:

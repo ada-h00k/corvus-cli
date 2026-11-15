@@ -1,0 +1,10 @@
+/run/host/var/home/user/Projekte/corvus-cli/target/debug/deps/idna-7a6d5965e93afd9d.d: /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/lib.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/deprecated.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/punycode.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/uts46.rs
+
+/run/host/var/home/user/Projekte/corvus-cli/target/debug/deps/libidna-7a6d5965e93afd9d.rlib: /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/lib.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/deprecated.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/punycode.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/uts46.rs
+
+/run/host/var/home/user/Projekte/corvus-cli/target/debug/deps/libidna-7a6d5965e93afd9d.rmeta: /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/lib.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/deprecated.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/punycode.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/uts46.rs
+
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/lib.rs:
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/deprecated.rs:
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/punycode.rs:
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/idna-1.1.0/src/uts46.rs:

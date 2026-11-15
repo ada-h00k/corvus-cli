@@ -1,0 +1,10 @@
+/run/host/var/home/user/Projekte/corvus-cli/target/debug/deps/sha1-0fe171ab2f9aa2c0.d: /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha1-0.10.7/src/lib.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha1-0.10.7/src/compress.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha1-0.10.7/src/compress/soft.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha1-0.10.7/src/compress/x86.rs
+
+/run/host/var/home/user/Projekte/corvus-cli/target/debug/deps/libsha1-0fe171ab2f9aa2c0.rlib: /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha1-0.10.7/src/lib.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha1-0.10.7/src/compress.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha1-0.10.7/src/compress/soft.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha1-0.10.7/src/compress/x86.rs
+
+/run/host/var/home/user/Projekte/corvus-cli/target/debug/deps/libsha1-0fe171ab2f9aa2c0.rmeta: /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha1-0.10.7/src/lib.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha1-0.10.7/src/compress.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha1-0.10.7/src/compress/soft.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha1-0.10.7/src/compress/x86.rs
+
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha1-0.10.7/src/lib.rs:
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha1-0.10.7/src/compress.rs:
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha1-0.10.7/src/compress/soft.rs:
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha1-0.10.7/src/compress/x86.rs:

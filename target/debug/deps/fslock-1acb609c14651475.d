@@ -1,0 +1,10 @@
+/run/host/var/home/user/Projekte/corvus-cli/target/debug/deps/fslock-1acb609c14651475.d: /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fslock-0.2.1/src/lib.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fslock-0.2.1/src/unix.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fslock-0.2.1/src/string.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fslock-0.2.1/src/fmt.rs
+
+/run/host/var/home/user/Projekte/corvus-cli/target/debug/deps/libfslock-1acb609c14651475.rlib: /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fslock-0.2.1/src/lib.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fslock-0.2.1/src/unix.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fslock-0.2.1/src/string.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fslock-0.2.1/src/fmt.rs
+
+/run/host/var/home/user/Projekte/corvus-cli/target/debug/deps/libfslock-1acb609c14651475.rmeta: /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fslock-0.2.1/src/lib.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fslock-0.2.1/src/unix.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fslock-0.2.1/src/string.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fslock-0.2.1/src/fmt.rs
+
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fslock-0.2.1/src/lib.rs:
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fslock-0.2.1/src/unix.rs:
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fslock-0.2.1/src/string.rs:
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fslock-0.2.1/src/fmt.rs:

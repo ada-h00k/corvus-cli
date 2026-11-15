@@ -12,13 +12,13 @@ path = "src/main.rs"
 
 # Kept apart from history-store so its minimal-dependency policy is unaffected.
 [dependencies]
-# The corvus integration branch of presage (it uses the one of libsignal-service-rs): upstream plus
-# the open pull requests corvus needs and corvus' own additions, see README.md. This rev adds the
+# The corvus integration branch of ada-h00k/presage: upstream plus the open pull requests corvus
+# needs and corvus' own additions, see README.md. This rev adds the
 # lock that serialises session state between sending and receiving (sessions overwritten by a
 # concurrent send made incoming messages fail with "invalid Whisper message: decryption failed").
 # cdsi: contact discovery, to find a phone number nobody synced (libsignal-net, BoringSSL)
-presage = { git = "https://github.com/ada-h00k/presage", rev = "db478944ff25ab79cf679b663a55a83f9d80b220", features = ["cdsi"] }
-presage-store-sqlite = { git = "https://github.com/ada-h00k/presage", rev = "db478944ff25ab79cf679b663a55a83f9d80b220", features = ["cdsi"] }
+presage = { git = "https://github.com/ada-h00k/presage", rev = "c789ac1a359983e66498fcf849ccb9b3eb9b20a1", features = ["cdsi"] }
+presage-store-sqlite = { git = "https://github.com/ada-h00k/presage", rev = "c789ac1a359983e66498fcf849ccb9b3eb9b20a1", features = ["cdsi"] }
 
 anyhow = "1.0"
 base64 = "0.23"
@@ -40,8 +40,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
 
 # Signal Server now requires the encrypted upload length when requesting a CDN upload form.
-# Keep the Corvus-specific presage integration while using the fixed service implementation.
-[patch."https://github.com/cyberneticangel/libsignal-service-rs"]
+# presage depends on whisperfish/libsignal-service-rs; replace it with the Corvus fork (open pull
+# requests and additions, plus the fix above).
+[patch."https://github.com/whisperfish/libsignal-service-rs"]
 libsignal-service = { git = "https://github.com/ada-h00k/libsignal-service-rs", rev = "ac4671b41fec9f381d24fc60f7c721e01650cf48" }
 
 # unoptimized ML-KEM can stack-overflow when decrypting PQXDH prekey messages

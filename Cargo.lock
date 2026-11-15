@@ -2922,7 +2922,7 @@ checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 [[package]]
 name = "presage"
 version = "0.8.0-dev"
-source = "git+https://github.com/ada-h00k/presage?rev=db478944ff25ab79cf679b663a55a83f9d80b220#db478944ff25ab79cf679b663a55a83f9d80b220"
+source = "git+https://github.com/ada-h00k/presage?rev=c789ac1a359983e66498fcf849ccb9b3eb9b20a1#c789ac1a359983e66498fcf849ccb9b3eb9b20a1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2949,7 +2949,7 @@ dependencies = [
 [[package]]
 name = "presage-store-sqlite"
 version = "0.8.0-dev"
-source = "git+https://github.com/ada-h00k/presage?rev=db478944ff25ab79cf679b663a55a83f9d80b220#db478944ff25ab79cf679b663a55a83f9d80b220"
+source = "git+https://github.com/ada-h00k/presage?rev=c789ac1a359983e66498fcf849ccb9b3eb9b20a1#c789ac1a359983e66498fcf849ccb9b3eb9b20a1"
 dependencies = [
  "async-trait",
  "bytes",

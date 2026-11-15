@@ -1,0 +1,10 @@
+/run/host/var/home/user/Projekte/corvus-cli/target/debug/deps/cexpr-c6cb971240ebdc99.d: /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cexpr-0.6.0/src/lib.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cexpr-0.6.0/src/expr.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cexpr-0.6.0/src/literal.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cexpr-0.6.0/src/token.rs
+
+/run/host/var/home/user/Projekte/corvus-cli/target/debug/deps/libcexpr-c6cb971240ebdc99.rlib: /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cexpr-0.6.0/src/lib.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cexpr-0.6.0/src/expr.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cexpr-0.6.0/src/literal.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cexpr-0.6.0/src/token.rs
+
+/run/host/var/home/user/Projekte/corvus-cli/target/debug/deps/libcexpr-c6cb971240ebdc99.rmeta: /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cexpr-0.6.0/src/lib.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cexpr-0.6.0/src/expr.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cexpr-0.6.0/src/literal.rs /var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cexpr-0.6.0/src/token.rs
+
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cexpr-0.6.0/src/lib.rs:
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cexpr-0.6.0/src/expr.rs:
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cexpr-0.6.0/src/literal.rs:
+/var/home/user/Distrobox/arch/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cexpr-0.6.0/src/token.rs:
