@@ -2922,7 +2922,7 @@ checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 [[package]]
 name = "presage"
 version = "0.8.0-dev"
-source = "git+https://github.com/cyberneticangel/presage?rev=f0dcc9e1c446bf7117ee6483f1af4454c795c66e#f0dcc9e1c446bf7117ee6483f1af4454c795c66e"
+source = "git+https://github.com/ada-h00k/presage?rev=db478944ff25ab79cf679b663a55a83f9d80b220#db478944ff25ab79cf679b663a55a83f9d80b220"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2949,7 +2949,7 @@ dependencies = [
 [[package]]
 name = "presage-store-sqlite"
 version = "0.8.0-dev"
-source = "git+https://github.com/cyberneticangel/presage?rev=f0dcc9e1c446bf7117ee6483f1af4454c795c66e#f0dcc9e1c446bf7117ee6483f1af4454c795c66e"
+source = "git+https://github.com/ada-h00k/presage?rev=db478944ff25ab79cf679b663a55a83f9d80b220#db478944ff25ab79cf679b663a55a83f9d80b220"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4253,7 +4253,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
