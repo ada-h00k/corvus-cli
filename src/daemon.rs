@@ -19,6 +19,7 @@ use presage::manager::Registered;
 use presage::model::groups::Group;
 use presage::model::messages::Received;
 use presage::proto::data_message::{quote, Delete, Flags, Quote, Reaction, UnpinMessage, pin_message::PinDuration, PinMessage};
+use presage::proto::data_message::{PollCreate, PollTerminate, PollVote};
 use presage::proto::receipt_message::Type as ReceiptType;
 use presage::proto::sync_message::Content as SyncContent;
 use presage::proto::typing_message::Action;
@@ -920,6 +921,9 @@ impl Daemon {
             "sendReaction" => self.send_reaction(p).await,
             "sendPinMessage" => self.send_pin_message(p).await,
             "sendUnpinMessage" => self.send_unpin_message(p).await,
+            "sendPollCreate" => self.send_poll_create(p).await,
+            "sendPollVote" => self.send_poll_vote(p).await,
+            "sendPollTerminate" => self.send_poll_terminate(p).await,
             "remoteDelete" => self.remote_delete(p).await,
             "sendReceipt" => self.send_receipt(p).await,
             "sendTyping" => self.send_typing(p).await,
@@ -1172,6 +1176,95 @@ impl Daemon {
                 target_author_aci_binary: Some(author.as_bytes().to_vec()),
                 target_sent_timestamp: Some(p.required_u64("targetTimestamp")?),
             }),
+            timestamp: Some(timestamp),
+            ..Default::default()
+        };
+        self.send_to(&targets, ContentBody::DataMessage(dm), timestamp).await
+    }
+
+    // signal-cli's sendPollCreate: a new poll for this chat. Like signal-cli, the question is
+    // limited to 200 characters and there are 2..=10 options of at most 100 characters each.
+    async fn send_poll_create(&self, p: &Params) -> RpcResult {
+        let targets = self.targets(p).await?;
+        let question = p.required_str("question")?.trim().to_owned();
+        if question.is_empty() {
+            return Err(RpcError::invalid("poll question must not be empty"));
+        }
+        if question.chars().count() > 200 {
+            return Err(RpcError::invalid("poll question exceeds the maximum length of 200 characters"));
+        }
+        let mut options = p.strings("option");
+        if options.is_empty() {
+            options = p.strings("options");
+        }
+        if options.len() < 2 {
+            return Err(RpcError::invalid("poll needs at least two options"));
+        }
+        if options.len() > 10 {
+            return Err(RpcError::invalid("poll cannot have more than 10 options"));
+        }
+        for option in &mut options {
+            *option = option.trim().to_owned();
+            if option.is_empty() {
+                return Err(RpcError::invalid("poll options must not be empty"));
+            }
+            if option.chars().count() > 100 {
+                return Err(RpcError::invalid("poll option exceeds the maximum length of 100 characters"));
+            }
+        }
+        // signal-cli takes --no-multi ("one option only"); an explicit allowMultiple wins if set.
+        let allow_multiple = if p.0.contains_key("allowMultiple") {
+            p.bool("allowMultiple")
+        } else {
+            !p.bool("noMulti")
+        };
+        let timestamp = now_ms();
+        let dm = DataMessage {
+            poll_create: Some(PollCreate {
+                question: Some(question),
+                allow_multiple: Some(allow_multiple),
+                options,
+            }),
+            timestamp: Some(timestamp),
+            ..Default::default()
+        };
+        self.send_to(&targets, ContentBody::DataMessage(dm), timestamp).await
+    }
+
+    // signal-cli's sendPollVote: vote on the poll identified by pollAuthor/pollTimestamp.
+    // option holds the selected option indexes; an empty list takes the vote back.
+    // voteCount counts up with every vote of the same voter (signal-cli requires it).
+    async fn send_poll_vote(&self, p: &Params) -> RpcResult {
+        let targets = self.targets(p).await?;
+        let author = self.resolve_aci(p.required_str("pollAuthor")?).await?;
+        let mut indexes = p.u64s("optionIndexes");
+        if indexes.is_empty() {
+            indexes = p.u64s("option");
+        }
+        if indexes.len() > 10 {
+            return Err(RpcError::invalid("poll vote cannot contain more than 10 option indexes"));
+        }
+        let timestamp = now_ms();
+        let dm = DataMessage {
+            poll_vote: Some(PollVote {
+                target_author_aci_binary: Some(author.as_bytes().to_vec()),
+                target_sent_timestamp: Some(p.required_u64("pollTimestamp")?),
+                option_indexes: indexes.into_iter().map(|i| u32::try_from(i).unwrap_or(u32::MAX)).collect(),
+                vote_count: Some(u32::try_from(p.required_u64("voteCount")?).unwrap_or(u32::MAX)),
+            }),
+            timestamp: Some(timestamp),
+            ..Default::default()
+        };
+        self.send_to(&targets, ContentBody::DataMessage(dm), timestamp).await
+    }
+
+    // signal-cli's sendPollTerminate: end the poll identified by pollTimestamp early.
+    // Only the poll's author can do that; the wire format carries no author on purpose.
+    async fn send_poll_terminate(&self, p: &Params) -> RpcResult {
+        let targets = self.targets(p).await?;
+        let timestamp = now_ms();
+        let dm = DataMessage {
+            poll_terminate: Some(PollTerminate { target_sent_timestamp: Some(p.required_u64("pollTimestamp")?) }),
             timestamp: Some(timestamp),
             ..Default::default()
         };

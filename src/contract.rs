@@ -13,6 +13,7 @@ use presage::model::groups::{AccessControl, Group, Member, RequestingMember};
 use presage::proto::attachment_pointer::AttachmentIdentifier;
 use presage::proto::body_range::{AssociatedValue, Style};
 use presage::proto::data_message::{quote, Delete, Flags, Quote, Reaction, Sticker, UnpinMessage, pin_message::PinDuration, PinMessage};
+use presage::proto::data_message::{PollCreate, PollTerminate, PollVote};
 use presage::proto::receipt_message::Type as ReceiptType;
 use presage::proto::sync_message::{Content as SyncContent, Sent};
 use presage::proto::typing_message::Action;
@@ -166,6 +167,31 @@ fn cases() -> Value {
         timestamp: Some(TS),
         ..Default::default()
     };
+    let poll_create = DataMessage {
+        poll_create: Some(PollCreate {
+            question: Some("Where to eat?".into()),
+            allow_multiple: Some(true),
+            options: vec!["Pizza".into(), "Sushi".into()],
+        }),
+        timestamp: Some(TS),
+        group_v2: Some(group_ctx()),
+        ..Default::default()
+    };
+    let poll_vote = DataMessage {
+        poll_vote: Some(PollVote {
+            target_author_aci_binary: Some(ME.as_bytes().to_vec()),
+            target_sent_timestamp: Some(TS - 2000),
+            option_indexes: vec![0, 1],
+            vote_count: Some(2),
+        }),
+        timestamp: Some(TS),
+        ..Default::default()
+    };
+    let poll_terminate = DataMessage {
+        poll_terminate: Some(PollTerminate { target_sent_timestamp: Some(TS - 2000) }),
+        timestamp: Some(TS),
+        ..Default::default()
+    };
     let expiration = DataMessage {
         flags: Some(Flags::ExpirationTimerUpdate as u32),
         expire_timer: Some(86400),
@@ -262,6 +288,9 @@ fn cases() -> Value {
         "pinForever": notification(ALICE, ContentBody::DataMessage(pin_forever)),
         "unpin": notification(ALICE, ContentBody::DataMessage(unpin)),
         "sticker": notification(ALICE, ContentBody::DataMessage(sticker)),
+        "pollCreate": notification(BOB, ContentBody::DataMessage(poll_create)),
+        "pollVote": notification(ALICE, ContentBody::DataMessage(poll_vote)),
+        "pollTerminate": notification(ALICE, ContentBody::DataMessage(poll_terminate)),
         "expiration": notification(ALICE, ContentBody::DataMessage(expiration)),
         "voiceNote": notification(ALICE, ContentBody::DataMessage(voice)),
         "viewOnce": notification(ALICE, ContentBody::DataMessage(view_once)),

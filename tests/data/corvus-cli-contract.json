@@ -253,6 +253,99 @@
       }
     }
   },
+  "pollCreate": {
+    "jsonrpc": "2.0",
+    "method": "receive",
+    "params": {
+      "account": "+49999",
+      "envelope": {
+        "dataMessage": {
+          "expiresInSeconds": 0,
+          "groupInfo": {
+            "groupId": "oroE+kkkL8I7/RAkLPCJTJXWJtGEQJ2C48QynhfRFe0=",
+            "revision": 3,
+            "type": "DELIVER"
+          },
+          "message": null,
+          "pollCreate": {
+            "allowMultiple": true,
+            "options": [
+              "Pizza",
+              "Sushi"
+            ],
+            "question": "Where to eat?"
+          },
+          "timestamp": 1790000000000,
+          "viewOnce": false
+        },
+        "serverReceivedTimestamp": 1790000000050,
+        "source": "22222222-2222-4222-8222-222222222222",
+        "sourceDevice": 1,
+        "sourceName": "Bob",
+        "sourceNumber": null,
+        "sourceUuid": "22222222-2222-4222-8222-222222222222",
+        "timestamp": 1790000000000
+      }
+    }
+  },
+  "pollTerminate": {
+    "jsonrpc": "2.0",
+    "method": "receive",
+    "params": {
+      "account": "+49999",
+      "envelope": {
+        "dataMessage": {
+          "expiresInSeconds": 0,
+          "message": null,
+          "pollTerminate": {
+            "targetSentTimestamp": 1789999998000
+          },
+          "timestamp": 1790000000000,
+          "viewOnce": false
+        },
+        "serverReceivedTimestamp": 1790000000050,
+        "source": "+49111",
+        "sourceDevice": 1,
+        "sourceName": "Alice",
+        "sourceNumber": "+49111",
+        "sourceUuid": "11111111-1111-4111-8111-111111111111",
+        "timestamp": 1790000000000
+      }
+    }
+  },
+  "pollVote": {
+    "jsonrpc": "2.0",
+    "method": "receive",
+    "params": {
+      "account": "+49999",
+      "envelope": {
+        "dataMessage": {
+          "expiresInSeconds": 0,
+          "message": null,
+          "pollVote": {
+            "author": "+49999",
+            "authorNumber": "+49999",
+            "authorUuid": "33333333-3333-4333-8333-333333333333",
+            "optionIndexes": [
+              0,
+              1
+            ],
+            "targetSentTimestamp": 1789999998000,
+            "voteCount": 2
+          },
+          "timestamp": 1790000000000,
+          "viewOnce": false
+        },
+        "serverReceivedTimestamp": 1790000000050,
+        "source": "+49111",
+        "sourceDevice": 1,
+        "sourceName": "Alice",
+        "sourceNumber": "+49111",
+        "sourceUuid": "11111111-1111-4111-8111-111111111111",
+        "timestamp": 1790000000000
+      }
+    }
+  },
   "reaction": {
     "jsonrpc": "2.0",
     "method": "receive",

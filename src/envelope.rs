@@ -8,6 +8,7 @@ use presage::libsignal_service::content::{Content, ContentBody, Metadata};
 use presage::libsignal_service::prelude::{GroupMasterKey, GroupSecretParams, Uuid};
 use presage::proto::attachment_pointer::AttachmentIdentifier;
 use presage::proto::data_message::{Flags, Quote, Reaction, UnpinMessage, pin_message::PinDuration, PinMessage};
+use presage::proto::data_message::{PollCreate, PollTerminate, PollVote};
 use presage::proto::receipt_message::Type as ReceiptType;
 use presage::proto::sync_message::{Content as SyncContent, Sent};
 use presage::proto::typing_message::Action;
@@ -145,6 +146,31 @@ fn unpin_json(dir: &Directory, unpin: &UnpinMessage) -> Value {
     Value::Object(out)
 }
 
+/// signal-cli's poll JSON: pollCreate / pollVote / pollTerminate of a dataMessage
+/// (src/main/java/org/asamk/signal/json/JsonPollCreate.java and friends).
+fn poll_create_json(poll: &PollCreate) -> Value {
+    json!({
+        "question": poll.question,
+        "allowMultiple": poll.allow_multiple.unwrap_or(false),
+        "options": poll.options,
+    })
+}
+
+fn poll_vote_json(dir: &Directory, vote: &PollVote) -> Value {
+    let mut out = Map::new();
+    if let Some(author) = aci(vote.target_author_aci_binary.as_deref(), None) {
+        dir.address(&mut out, "author", author);
+    }
+    out.insert("targetSentTimestamp".into(), json!(vote.target_sent_timestamp));
+    out.insert("optionIndexes".into(), json!(vote.option_indexes));
+    out.insert("voteCount".into(), json!(vote.vote_count.unwrap_or(0)));
+    Value::Object(out)
+}
+
+fn poll_terminate_json(terminate: &PollTerminate) -> Value {
+    json!({"targetSentTimestamp": terminate.target_sent_timestamp})
+}
+
 /// The members of a signal-cli dataMessage, also used inside syncMessage.sentMessage.
 fn data_message_fields(dir: &Directory, dm: &DataMessage, out: &mut Map<String, Value>) {
     out.insert("timestamp".into(), json!(dm.timestamp));
@@ -188,6 +214,15 @@ fn data_message_fields(dir: &Directory, dm: &DataMessage, out: &mut Map<String, 
                 "emoji": sticker.emoji,
             }),
         );
+    }
+    if let Some(poll) = &dm.poll_create {
+        out.insert("pollCreate".into(), poll_create_json(poll));
+    }
+    if let Some(vote) = &dm.poll_vote {
+        out.insert("pollVote".into(), poll_vote_json(dir, vote));
+    }
+    if let Some(terminate) = &dm.poll_terminate {
+        out.insert("pollTerminate".into(), poll_terminate_json(terminate));
     }
     if !dm.preview.is_empty() {
         let previews: Vec<Value> = dm
@@ -452,6 +487,65 @@ mod tests {
         let env = to_envelope(&dir(), &content(ContentBody::TypingMessage(typing))).unwrap();
         assert_eq!(env["typingMessage"]["action"], "STOPPED");
         assert_eq!(env["typingMessage"]["groupId"], "AQID");
+    }
+
+    #[test]
+    fn poll_create_vote_and_terminate() {
+        let create = DataMessage {
+            poll_create: Some(PollCreate {
+                question: Some("Where to eat?".into()),
+                allow_multiple: Some(true),
+                options: vec!["Pizza".into(), "Sushi".into()],
+            }),
+            timestamp: Some(1_700_000_000_000),
+            ..Default::default()
+        };
+        let env = to_envelope(&dir(), &content(ContentBody::DataMessage(create))).unwrap();
+        let d = &env["dataMessage"];
+        assert_eq!(d["pollCreate"]["question"], "Where to eat?");
+        assert_eq!(d["pollCreate"]["allowMultiple"], true);
+        assert_eq!(d["pollCreate"]["options"], json!(["Pizza", "Sushi"]));
+
+        let vote = DataMessage {
+            poll_vote: Some(PollVote {
+                target_author_aci_binary: Some(Uuid::parse_str(ALICE).unwrap().as_bytes().to_vec()),
+                target_sent_timestamp: Some(5),
+                option_indexes: vec![1],
+                vote_count: Some(2),
+            }),
+            timestamp: Some(1_700_000_000_000),
+            ..Default::default()
+        };
+        let env = to_envelope(&dir(), &content(ContentBody::DataMessage(vote))).unwrap();
+        let v = &env["dataMessage"]["pollVote"];
+        assert_eq!(v["authorNumber"], "+491111");
+        assert_eq!(v["authorUuid"], ALICE);
+        assert_eq!(v["targetSentTimestamp"], 5);
+        assert_eq!(v["optionIndexes"], json!([1]));
+        assert_eq!(v["voteCount"], 2);
+
+        // A vote without a voteCount (older sender) is reported as the first vote.
+        let plain_vote = DataMessage {
+            poll_vote: Some(PollVote {
+                target_author_aci_binary: Some(Uuid::parse_str(ALICE).unwrap().as_bytes().to_vec()),
+                target_sent_timestamp: Some(6),
+                ..Default::default()
+            }),
+            timestamp: Some(1_700_000_000_000),
+            ..Default::default()
+        };
+        let env = to_envelope(&dir(), &content(ContentBody::DataMessage(plain_vote))).unwrap();
+        let v = &env["dataMessage"]["pollVote"];
+        assert_eq!(v["optionIndexes"], json!([]));
+        assert_eq!(v["voteCount"], 0);
+
+        let terminate = DataMessage {
+            poll_terminate: Some(PollTerminate { target_sent_timestamp: Some(5) }),
+            timestamp: Some(1_700_000_000_000),
+            ..Default::default()
+        };
+        let env = to_envelope(&dir(), &content(ContentBody::DataMessage(terminate))).unwrap();
+        assert_eq!(env["dataMessage"]["pollTerminate"]["targetSentTimestamp"], 5);
     }
 
     #[test]
