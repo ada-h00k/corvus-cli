@@ -18,7 +18,7 @@ use presage::libsignal_service::sender::AttachmentSpec;
 use presage::manager::Registered;
 use presage::model::groups::Group;
 use presage::model::messages::Received;
-use presage::proto::data_message::{quote, Delete, Flags, Quote, Reaction};
+use presage::proto::data_message::{quote, Delete, Flags, Quote, Reaction, UnpinMessage, pin_message::PinDuration, PinMessage};
 use presage::proto::receipt_message::Type as ReceiptType;
 use presage::proto::sync_message::Content as SyncContent;
 use presage::proto::typing_message::Action;
@@ -918,6 +918,8 @@ impl Daemon {
             "listGroups" => self.list_groups(p).await,
             "send" => self.send(p).await,
             "sendReaction" => self.send_reaction(p).await,
+            "sendPinMessage" => self.send_pin_message(p).await,
+            "sendUnpinMessage" => self.send_unpin_message(p).await,
             "remoteDelete" => self.remote_delete(p).await,
             "sendReceipt" => self.send_receipt(p).await,
             "sendTyping" => self.send_typing(p).await,
@@ -1130,6 +1132,43 @@ impl Daemon {
                 emoji: Some(p.required_str("emoji")?.to_owned()),
                 remove: Some(p.bool("remove")),
                 target_author_aci: Some(author.to_string()),
+                target_author_aci_binary: Some(author.as_bytes().to_vec()),
+                target_sent_timestamp: Some(p.required_u64("targetTimestamp")?),
+            }),
+            timestamp: Some(timestamp),
+            ..Default::default()
+        };
+        self.send_to(&targets, ContentBody::DataMessage(dm), timestamp).await
+    }
+
+    // signal-cli's sendPinMessage: an empty dataMessage that pins a message of this chat for
+    // everyone. pinDuration is seconds (-1 = forever); it is optional and defaults to forever.
+    async fn send_pin_message(&self, p: &Params) -> RpcResult {
+        let targets = self.targets(p).await?;
+        let author = self.resolve_aci(p.required_str("targetAuthor")?).await?;
+        let timestamp = now_ms();
+        let dm = DataMessage {
+            pin_message: Some(PinMessage {
+                target_author_aci_binary: Some(author.as_bytes().to_vec()),
+                target_sent_timestamp: Some(p.required_u64("targetTimestamp")?),
+                pin_duration: match p.i64("pinDuration").unwrap_or(-1) {
+                    -1 => Some(PinDuration::PinDurationForever(true)),
+                    seconds if seconds > 0 => Some(PinDuration::PinDurationSeconds(seconds as u32)),
+                    _ => None, // unspecified: receivers keep their own policy (corvus pins for good)
+                },
+            }),
+            timestamp: Some(timestamp),
+            ..Default::default()
+        };
+        self.send_to(&targets, ContentBody::DataMessage(dm), timestamp).await
+    }
+
+    async fn send_unpin_message(&self, p: &Params) -> RpcResult {
+        let targets = self.targets(p).await?;
+        let author = self.resolve_aci(p.required_str("targetAuthor")?).await?;
+        let timestamp = now_ms();
+        let dm = DataMessage {
+            unpin_message: Some(UnpinMessage {
                 target_author_aci_binary: Some(author.as_bytes().to_vec()),
                 target_sent_timestamp: Some(p.required_u64("targetTimestamp")?),
             }),

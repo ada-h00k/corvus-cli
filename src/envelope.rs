@@ -7,7 +7,7 @@ use base64::prelude::*;
 use presage::libsignal_service::content::{Content, ContentBody, Metadata};
 use presage::libsignal_service::prelude::{GroupMasterKey, GroupSecretParams, Uuid};
 use presage::proto::attachment_pointer::AttachmentIdentifier;
-use presage::proto::data_message::{Flags, Quote, Reaction};
+use presage::proto::data_message::{Flags, Quote, Reaction, UnpinMessage, pin_message::PinDuration, PinMessage};
 use presage::proto::receipt_message::Type as ReceiptType;
 use presage::proto::sync_message::{Content as SyncContent, Sent};
 use presage::proto::typing_message::Action;
@@ -120,6 +120,31 @@ fn reaction_json(dir: &Directory, reaction: &Reaction) -> Value {
     Value::Object(out)
 }
 
+/// signal-cli's pinDurationSeconds convention: -1 = forever, 0 = unspecified, else seconds.
+fn pin_json(dir: &Directory, pin: &PinMessage) -> Value {
+    let mut out = Map::new();
+    if let Some(author) = aci(pin.target_author_aci_binary.as_deref(), None) {
+        dir.address(&mut out, "targetAuthor", author);
+    }
+    out.insert("targetSentTimestamp".into(), json!(pin.target_sent_timestamp));
+    let seconds = match pin.pin_duration {
+        Some(PinDuration::PinDurationSeconds(s)) => s as i64,
+        Some(PinDuration::PinDurationForever(true)) => -1,
+        _ => 0,
+    };
+    out.insert("pinDurationSeconds".into(), json!(seconds));
+    Value::Object(out)
+}
+
+fn unpin_json(dir: &Directory, unpin: &UnpinMessage) -> Value {
+    let mut out = Map::new();
+    if let Some(author) = aci(unpin.target_author_aci_binary.as_deref(), None) {
+        dir.address(&mut out, "targetAuthor", author);
+    }
+    out.insert("targetSentTimestamp".into(), json!(unpin.target_sent_timestamp));
+    Value::Object(out)
+}
+
 /// The members of a signal-cli dataMessage, also used inside syncMessage.sentMessage.
 fn data_message_fields(dir: &Directory, dm: &DataMessage, out: &mut Map<String, Value>) {
     out.insert("timestamp".into(), json!(dm.timestamp));
@@ -147,6 +172,12 @@ fn data_message_fields(dir: &Directory, dm: &DataMessage, out: &mut Map<String, 
     }
     if let Some(ts) = dm.delete.as_ref().and_then(|d| d.target_sent_timestamp) {
         out.insert("remoteDelete".into(), json!({"timestamp": ts}));
+    }
+    if let Some(pin) = &dm.pin_message {
+        out.insert("pinMessage".into(), pin_json(dir, pin));
+    }
+    if let Some(unpin) = &dm.unpin_message {
+        out.insert("unpinMessage".into(), unpin_json(dir, unpin));
     }
     if let Some(sticker) = &dm.sticker {
         out.insert(
@@ -352,6 +383,62 @@ mod tests {
         assert_eq!(r["targetAuthorUuid"], ALICE);
         assert_eq!(r["targetSentTimestamp"], 5);
         assert_eq!(r["isRemove"], false);
+    }
+
+    #[test]
+    fn pin_and_unpin_durations() {
+        let dir = dir();
+        let alice = Uuid::parse_str(ALICE).unwrap().as_bytes().to_vec();
+        let pin_seconds = DataMessage {
+            pin_message: Some(PinMessage {
+                target_author_aci_binary: Some(alice.clone()),
+                target_sent_timestamp: Some(5),
+                pin_duration: Some(PinDuration::PinDurationSeconds(604_800)),
+            }),
+            ..Default::default()
+        };
+        let env = to_envelope(&dir, &content(ContentBody::DataMessage(pin_seconds))).unwrap();
+        let p = &env["dataMessage"]["pinMessage"];
+        assert_eq!(p["targetAuthorNumber"], "+491111");
+        assert_eq!(p["targetAuthorUuid"], ALICE);
+        assert_eq!(p["targetSentTimestamp"], 5);
+        assert_eq!(p["pinDurationSeconds"], 604800);
+
+        let pin_forever = DataMessage {
+            pin_message: Some(PinMessage {
+                target_author_aci_binary: Some(alice.clone()),
+                target_sent_timestamp: Some(6),
+                pin_duration: Some(PinDuration::PinDurationForever(true)),
+            }),
+            ..Default::default()
+        };
+        let env = to_envelope(&dir, &content(ContentBody::DataMessage(pin_forever))).unwrap();
+        assert_eq!(env["dataMessage"]["pinMessage"]["pinDurationSeconds"], -1);
+
+        // No duration given: "unspecified" (0), like signal-cli reports it.
+        let pin_plain = DataMessage {
+            pin_message: Some(PinMessage {
+                target_author_aci_binary: Some(alice.clone()),
+                target_sent_timestamp: Some(7),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let env = to_envelope(&dir, &content(ContentBody::DataMessage(pin_plain))).unwrap();
+        assert_eq!(env["dataMessage"]["pinMessage"]["pinDurationSeconds"], 0);
+
+        let unpin = DataMessage {
+            unpin_message: Some(UnpinMessage {
+                target_author_aci_binary: Some(alice),
+                target_sent_timestamp: Some(5),
+            }),
+            ..Default::default()
+        };
+        let env = to_envelope(&dir, &content(ContentBody::DataMessage(unpin))).unwrap();
+        let u = &env["dataMessage"]["unpinMessage"];
+        assert_eq!(u["targetAuthorUuid"], ALICE);
+        assert_eq!(u["targetSentTimestamp"], 5);
+        assert!(u.get("pinDurationSeconds").is_none());
     }
 
     #[test]

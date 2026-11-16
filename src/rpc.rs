@@ -122,6 +122,15 @@ impl Params {
         self.u64(key).ok_or_else(|| RpcError::invalid(format!("missing parameter '{key}'")))
     }
 
+    /// Signed values like signal-cli's pinDuration (-1 = forever).
+    pub fn i64(&self, key: &str) -> Option<i64> {
+        match self.0.get(key)? {
+            Value::Number(n) => n.as_i64(),
+            Value::String(s) => s.parse().ok(),
+            _ => None,
+        }
+    }
+
     pub fn u64s(&self, key: &str) -> Vec<u64> {
         match self.0.get(key) {
             Some(Value::Array(a)) => a
@@ -164,11 +173,12 @@ mod tests {
 
     #[test]
     fn scalar_and_list_shapes() {
-        let p = Params(serde_json::from_str(r#"{"a":"x","b":["y","z"],"t":["5",6],"n":"7"}"#).unwrap());
+        let p = Params(serde_json::from_str(r#"{"a":"x","b":["y","z"],"t":["5",6],"n":"7","d":-1}"#).unwrap());
         assert_eq!(p.strings("a"), ["x"]);
         assert_eq!(p.str("b"), Some("y"));
         assert_eq!(p.u64s("t"), [5, 6]);
         assert_eq!(p.u64("n"), Some(7));
+        assert_eq!(p.i64("d"), Some(-1));
     }
 
     #[test]

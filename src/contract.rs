@@ -12,7 +12,7 @@ use presage::libsignal_service::protocol::ServiceId;
 use presage::model::groups::{AccessControl, Group, Member, RequestingMember};
 use presage::proto::attachment_pointer::AttachmentIdentifier;
 use presage::proto::body_range::{AssociatedValue, Style};
-use presage::proto::data_message::{quote, Delete, Flags, Quote, Reaction, Sticker};
+use presage::proto::data_message::{quote, Delete, Flags, Quote, Reaction, Sticker, UnpinMessage, pin_message::PinDuration, PinMessage};
 use presage::proto::receipt_message::Type as ReceiptType;
 use presage::proto::sync_message::{Content as SyncContent, Sent};
 use presage::proto::typing_message::Action;
@@ -129,6 +129,32 @@ fn cases() -> Value {
         timestamp: Some(TS),
         ..Default::default()
     };
+    let pin = DataMessage {
+        pin_message: Some(PinMessage {
+            target_author_aci_binary: Some(ME.as_bytes().to_vec()),
+            target_sent_timestamp: Some(TS - 3000),
+            pin_duration: Some(PinDuration::PinDurationSeconds(86400)),
+        }),
+        timestamp: Some(TS),
+        ..Default::default()
+    };
+    let pin_forever = DataMessage {
+        pin_message: Some(PinMessage {
+            target_author_aci_binary: Some(ME.as_bytes().to_vec()),
+            target_sent_timestamp: Some(TS - 3000),
+            pin_duration: Some(PinDuration::PinDurationForever(true)),
+        }),
+        timestamp: Some(TS),
+        ..Default::default()
+    };
+    let unpin = DataMessage {
+        unpin_message: Some(UnpinMessage {
+            target_author_aci_binary: Some(ME.as_bytes().to_vec()),
+            target_sent_timestamp: Some(TS - 3000),
+        }),
+        timestamp: Some(TS),
+        ..Default::default()
+    };
     let sticker = DataMessage {
         sticker: Some(Sticker {
             pack_id: Some(vec![0xab, 0xcd]),
@@ -232,6 +258,9 @@ fn cases() -> Value {
         "groupText": notification(BOB, ContentBody::DataMessage(group_text)),
         "reaction": notification(ALICE, ContentBody::DataMessage(reaction)),
         "delete": notification(ALICE, ContentBody::DataMessage(delete)),
+        "pin": notification(ALICE, ContentBody::DataMessage(pin)),
+        "pinForever": notification(ALICE, ContentBody::DataMessage(pin_forever)),
+        "unpin": notification(ALICE, ContentBody::DataMessage(unpin)),
         "sticker": notification(ALICE, ContentBody::DataMessage(sticker)),
         "expiration": notification(ALICE, ContentBody::DataMessage(expiration)),
         "voiceNote": notification(ALICE, ContentBody::DataMessage(voice)),
