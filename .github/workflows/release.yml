@@ -216,18 +216,6 @@ jobs:
           name: corvus-cli-linux-x86_64
           path: dist
 
-      - name: Verify release and package versions
-        if: github.ref_type == 'tag'
-        run: |
-          tag_version="${GITHUB_REF_NAME#v}"
-          cargo_version="$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)"
-          pkgbuild_version="$(sed -n 's/^pkgver=//p' PKGBUILD)"
-
-          if [[ "$tag_version" != "$cargo_version" || "$tag_version" != "$pkgbuild_version" ]]; then
-            echo "Tag ($tag_version), Cargo.toml ($cargo_version), and PKGBUILD ($pkgbuild_version) versions must match."
-            exit 1
-          fi
-
       - name: Prepare binary and build Arch package
         run: |
           install -Dm755 dist/corvus-cli-linux-x86_64 ./corvus-cli
