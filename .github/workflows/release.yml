@@ -183,35 +183,33 @@ jobs:
       - name: Upload release asset
         uses: actions/upload-artifact@v7
         with:
+          name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
           archive: false
           if-no-files-found: error
           retention-days: 1
 
   build-arch-package:
-    name: Build Arch Linux package
-    # Run on the fix branch as a packaging smoke test, and on versioned releases.
+    name: Package Linux binary for Arch
+    # Package the already-built Linux binary; do not compile Rust a second time.
+    needs: build
     if: github.ref_type == 'tag' || github.ref == 'refs/heads/fix/arch-sqlite-linkage'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     container:
       image: archlinux:base-devel
     steps:
-      - name: Install Arch build dependencies
-        run: |
-          pacman -Syu --noconfirm --needed \
-            cargo \
-            clang \
-            cmake \
-            git \
-            openssl \
-            protobuf \
-            pkgconf \
-            shadow \
-            sqlite
+      - name: Install minimal Arch packaging dependencies
+        run: pacman -Syu --noconfirm --needed shadow
 
       - name: Check out source
         uses: actions/checkout@v7
+
+      - name: Download Linux binary from build job
+        uses: actions/download-artifact@v8
+        with:
+          name: corvus-cli-linux-x86_64
+          path: dist
 
       - name: Verify release and package versions
         if: github.ref_type == 'tag'
@@ -225,8 +223,9 @@ jobs:
             exit 1
           fi
 
-      - name: Build package with makepkg
+      - name: Prepare binary and build Arch package
         run: |
+          install -Dm755 dist/corvus-cli-linux-x86_64 ./corvus-cli
           useradd --create-home builder
           chown -R builder:builder "$GITHUB_WORKSPACE"
           runuser -u builder -- makepkg --cleanbuild --noconfirm
@@ -242,7 +241,7 @@ jobs:
 
   publish-release:
     name: Publish GitHub release
-    needs: build
+    needs: [build, build-arch-package]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
