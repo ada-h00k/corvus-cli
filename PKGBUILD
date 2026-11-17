@@ -10,6 +10,7 @@ license=('AGPL-3.0-only')
 depends=('gcc-libs' 'glibc' 'openssl')
 source=('corvus-cli' 'LICENSE' 'README.md')
 noextract=('corvus-cli')
+options=('!debug')
 sha256sums=('SKIP' 'SKIP' 'SKIP')
 
 package() {
