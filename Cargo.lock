@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "corvus-cli"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2326,7 +2326,7 @@ dependencies = [
 [[package]]
 name = "libsignal-service"
 version = "0.1.0"
-source = "git+https://github.com/ada-h00k/libsignal-service-rs?rev=ac4671b41fec9f381d24fc60f7c721e01650cf48#ac4671b41fec9f381d24fc60f7c721e01650cf48"
+source = "git+https://github.com/ada-h00k/libsignal-service-rs?branch=contact-aci#7f2e7415aa44577ee14876ad18f57951155b7f8d"
 dependencies = [
  "aes 0.9.1",
  "aes-gcm",
@@ -2922,7 +2922,7 @@ checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 [[package]]
 name = "presage"
 version = "0.8.0-dev"
-source = "git+https://github.com/ada-h00k/presage?rev=c789ac1a359983e66498fcf849ccb9b3eb9b20a1#c789ac1a359983e66498fcf849ccb9b3eb9b20a1"
+source = "git+https://github.com/ada-h00k/presage?branch=corvus#6588d44696ce3efbb6a0b2a5efbe423903f4ee25"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2949,7 +2949,7 @@ dependencies = [
 [[package]]
 name = "presage-store-sqlite"
 version = "0.8.0-dev"
-source = "git+https://github.com/ada-h00k/presage?rev=c789ac1a359983e66498fcf849ccb9b3eb9b20a1#c789ac1a359983e66498fcf849ccb9b3eb9b20a1"
+source = "git+https://github.com/ada-h00k/presage?branch=corvus#6588d44696ce3efbb6a0b2a5efbe423903f4ee25"
 dependencies = [
  "async-trait",
  "bytes",
