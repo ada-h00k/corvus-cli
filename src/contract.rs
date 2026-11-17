@@ -196,6 +196,7 @@ fn cases() -> Value {
         contact: vec![Contact {
             name: Some(ContactName { given_name: Some("Alice".into()), ..Default::default() }),
             number: vec![ContactPhone { value: Some("+49111".into()), ..Default::default() }],
+            aci_binary: Some(ALICE.as_bytes().to_vec()),
             avatar: Some(ContactAvatar {
                 avatar: Some(AttachmentPointer {
                     attachment_identifier: Some(AttachmentIdentifier::CdnId(987654321)),

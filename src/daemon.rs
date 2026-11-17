@@ -1272,9 +1272,11 @@ impl Daemon {
         self.send_to(&targets, ContentBody::DataMessage(dm), timestamp).await
     }
 
-    // corvus-cli 1.5.0 (extension): a contact card as a DataMessage.contact entry — the
+    // corvus-cli 1.6.0 (extension): a contact card as a DataMessage.contact entry — the
     // same wire format the official clients send. The name is carried as displayName in
-    // the Name sub-message, an optional phone number as the first Phone entry, and an
+    // the Name sub-message, an optional phone number as the first Phone entry, the
+    // optional serviceId as the 16-byte aciBinary (field 8, the way the official clients
+    // carry it — it lets the recipient open a chat for a UUID-only contact), and an
     // optional avatar as an AttachmentPointer (the image is uploaded like any attachment).
     // signal-cli cannot send or report contacts, so only Corvus understands these.
     async fn send_contact(&self, p: &Params) -> RpcResult {
@@ -1284,6 +1286,14 @@ impl Daemon {
             return Err(RpcError::invalid("contact name must not be empty"));
         }
         let number = p.str("number").map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
+        // A malformed serviceId must not end up on the wire half-parsed.
+        let aci = match p.str("uuid").filter(|u| !u.trim().is_empty()) {
+            Some(raw) => match Uuid::parse_str(raw.trim()) {
+                Ok(id) => Some(id.as_bytes().to_vec()),
+                Err(_) => return Err(RpcError::invalid("contact uuid must be a valid serviceId (UUID)")),
+            },
+            None => None,
+        };
         let avatar = match p.str("avatar").filter(|b| !b.trim().is_empty()) {
             Some(b64) => {
                 use base64::{prelude::BASE64_STANDARD, Engine as _};
@@ -1314,6 +1324,7 @@ impl Daemon {
                 number: number
                     .map(|n| vec![ContactPhone { value: Some(n), ..Default::default() }])
                     .unwrap_or_default(),
+                aci_binary: aci,
                 ..Default::default()
             }],
             timestamp: Some(timestamp),

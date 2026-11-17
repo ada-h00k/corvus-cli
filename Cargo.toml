@@ -1,6 +1,6 @@
 [package]
 name = "corvus-cli"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 rust-version = "1.85"
 license = "AGPL-3.0-only"
@@ -39,11 +39,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 [patch.crates-io]
 libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
 
-# Signal Server now requires the encrypted upload length when requesting a CDN upload form.
-# presage depends on whisperfish/libsignal-service-rs; replace it with the Corvus fork (open pull
-# requests and additions, plus the fix above).
-[patch."https://github.com/whisperfish/libsignal-service-rs"]
-libsignal-service = { git = "https://github.com/ada-h00k/libsignal-service-rs", rev = "ac4671b41fec9f381d24fc60f7c721e01650cf48" }
+# presage declares the Corvus libsignal-service fork directly; the contact-aci branch
+# adds the EmbeddedContact aciBinary field (16-byte serviceId, field 8) that the
+# official clients carry on shared contact cards — corvus-cli 1.6.0 sends and reads it.
+[patch."https://github.com/ada-h00k/libsignal-service-rs"]
+libsignal-service = { git = "https://github.com/ada-h00k/libsignal-service-rs", branch = "contact-aci" }
 
 # unoptimized ML-KEM can stack-overflow when decrypting PQXDH prekey messages
 [profile.dev.package.libcrux-ml-kem]

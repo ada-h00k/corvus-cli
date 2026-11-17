@@ -173,8 +173,10 @@ fn poll_terminate_json(terminate: &PollTerminate) -> Value {
 
 /// corvus-cli's contact JSON (since 1.5.0): the Contact cards of a dataMessage.
 /// The name is the displayName (here the given name Corvus sends), the number is the
-/// first Phone entry and the avatar is reported like any attachment pointer.
-/// signal-cli has no equivalent, so Corvus sees these only via corvus-cli.
+/// first Phone entry, the uuid is the optional serviceId (since 1.6.0, carried as the
+/// 16-byte aciBinary field exactly like the official clients do) and the avatar is
+/// reported like any attachment pointer. signal-cli has no equivalent, so Corvus sees
+/// these only via corvus-cli.
 fn contact_json(contact: &Contact) -> Value {
     let mut out = Map::new();
     if let Some(name) = &contact.name {
@@ -182,6 +184,11 @@ fn contact_json(contact: &Contact) -> Value {
     }
     if let Some(first) = contact.number.first() {
         out.insert("number".into(), json!(first.value));
+    }
+    if let Some(aci) = &contact.aci_binary {
+        if let Ok(id) = Uuid::from_slice(aci) {
+            out.insert("uuid".into(), json!(id.to_string()));
+        }
     }
     if let Some(pointer) = contact.avatar.as_ref().and_then(|avatar| avatar.avatar.as_ref()) {
         out.insert("avatar".into(), attachment_json(pointer));
