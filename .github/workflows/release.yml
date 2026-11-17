@@ -187,6 +187,56 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  build-arch-package:
+    name: Build Arch Linux package
+    # Arch packages are created for versioned releases, not for every branch push.
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install Arch build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            cargo \
+            clang \
+            cmake \
+            git \
+            openssl \
+            protobuf \
+            pkgconf \
+            shadow
+
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Verify release and package versions
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)"
+          pkgbuild_version="$(sed -n 's/^pkgver=//p' PKGBUILD)"
+
+          if [[ "$tag_version" != "$cargo_version" || "$tag_version" != "$pkgbuild_version" ]]; then
+            echo "Tag ($tag_version), Cargo.toml ($cargo_version), and PKGBUILD ($pkgbuild_version) versions must match."
+            exit 1
+          fi
+
+      - name: Build package with makepkg
+        run: |
+          useradd --create-home builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          runuser -u builder -- makepkg --cleanbuild --noconfirm
+
+      - name: Upload Arch Linux package
+        uses: actions/upload-artifact@v7
+        with:
+          name: arch-linux-package
+          path: '*.pkg.tar.zst'
+          archive: false
+          if-no-files-found: error
+          retention-days: 1
+
   publish-release:
     name: Publish GitHub release
     needs: build
