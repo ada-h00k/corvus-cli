@@ -91,6 +91,11 @@ jobs:
           export VCPKG_DEFAULT_BINARY_CACHE="$RUNNER_TEMP/vcpkg-binary-cache"
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE" "$VCPKG_INSTALLATION_ROOT/downloads"
 
+          # The shared downloads cache can contain a partially extracted vcpkg Perl tool.
+          # Remove it so vcpkg reinstalls a complete copy before configuring OpenSSL.
+          rm -rf "$VCPKG_INSTALLATION_ROOT/downloads/tools/perl"
+          rm -f "$VCPKG_INSTALLATION_ROOT/downloads/strawberry-perl-5.42.2.1-64bit-portable.zip"
+
           fetch() {
             local out="$VCPKG_INSTALLATION_ROOT/downloads/$2"
             if [ -s "$out" ]; then
