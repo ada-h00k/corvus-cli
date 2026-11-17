@@ -54,6 +54,7 @@ jobs:
             cmake \
             libclang-dev \
             libssl-dev \
+            libsqlite3-dev \
             pkg-config \
             protobuf-compiler
 
@@ -189,8 +190,8 @@ jobs:
 
   build-arch-package:
     name: Build Arch Linux package
-    # Arch packages are created for versioned releases, not for every branch push.
-    if: github.ref_type == 'tag'
+    # Run on the fix branch as a packaging smoke test, and on versioned releases.
+    if: github.ref_type == 'tag' || github.ref == 'refs/heads/fix/arch-sqlite-linkage'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     container:
@@ -206,12 +207,14 @@ jobs:
             openssl \
             protobuf \
             pkgconf \
-            shadow
+            shadow \
+            sqlite
 
       - name: Check out source
         uses: actions/checkout@v7
 
       - name: Verify release and package versions
+        if: github.ref_type == 'tag'
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
           cargo_version="$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)"

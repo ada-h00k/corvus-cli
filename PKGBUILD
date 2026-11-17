@@ -8,7 +8,7 @@ arch=('x86_64')
 url='https://github.com/ada-h00k/corvus-cli'
 license=('AGPL-3.0-only')
 depends=('gcc-libs' 'glibc' 'openssl')
-makedepends=('cargo' 'clang' 'cmake' 'git' 'protobuf' 'pkgconf')
+makedepends=('cargo' 'clang' 'cmake' 'git' 'protobuf' 'pkgconf' 'sqlite')
 source=("${pkgname}::git+https://github.com/ada-h00k/corvus-cli.git#tag=v${pkgver}")
 sha256sums=('SKIP')
 
