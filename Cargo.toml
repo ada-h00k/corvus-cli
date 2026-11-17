@@ -13,12 +13,12 @@ path = "src/main.rs"
 # Kept apart from history-store so its minimal-dependency policy is unaffected.
 [dependencies]
 # The corvus integration branch of ada-h00k/presage: upstream plus the open pull requests corvus
-# needs and corvus' own additions, see README.md. This rev adds the
-# lock that serialises session state between sending and receiving (sessions overwritten by a
-# concurrent send made incoming messages fail with "invalid Whisper message: decryption failed").
+# needs and corvus' own additions, see README.md. It resolves libsignal-service from the fork's
+# contact-aci branch (ac4671b plus the EmbeddedContact aciBinary field), which corvus-cli 1.6.0
+# sends and reads so the recipient can message a UUID-only contact.
 # cdsi: contact discovery, to find a phone number nobody synced (libsignal-net, BoringSSL)
-presage = { git = "https://github.com/ada-h00k/presage", rev = "c789ac1a359983e66498fcf849ccb9b3eb9b20a1", features = ["cdsi"] }
-presage-store-sqlite = { git = "https://github.com/ada-h00k/presage", rev = "c789ac1a359983e66498fcf849ccb9b3eb9b20a1", features = ["cdsi"] }
+presage = { git = "https://github.com/ada-h00k/presage", branch = "corvus", features = ["cdsi"] }
+presage-store-sqlite = { git = "https://github.com/ada-h00k/presage", branch = "corvus", features = ["cdsi"] }
 
 anyhow = "1.0"
 base64 = "0.23"
@@ -38,12 +38,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Same patches as the presage workspace; [patch] does not propagate from dependencies.
 [patch.crates-io]
 libsqlite3-sys = { version = "0.36.0", git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
-
-# presage declares the Corvus libsignal-service fork directly; the contact-aci branch
-# adds the EmbeddedContact aciBinary field (16-byte serviceId, field 8) that the
-# official clients carry on shared contact cards — corvus-cli 1.6.0 sends and reads it.
-[patch."https://github.com/ada-h00k/libsignal-service-rs"]
-libsignal-service = { git = "https://github.com/ada-h00k/libsignal-service-rs", branch = "contact-aci" }
 
 # unoptimized ML-KEM can stack-overflow when decrypting PQXDH prekey messages
 [profile.dev.package.libcrux-ml-kem]
