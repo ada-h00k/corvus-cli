@@ -17,6 +17,20 @@ Needs Rust 1.85+, `protoc`, and clang and cmake (libsignal's BoringSSL).
 
 The binary is `target/release/corvus-cli`.
 
+## Arch Linux package
+
+Each versioned GitHub release also includes an installable Arch Linux package
+(`corvus-cli-<version>-1-x86_64.pkg.tar.zst`). Install it with:
+
+    sudo pacman -U corvus-cli-<version>-1-x86_64.pkg.tar.zst
+
+To build the package locally from a checkout, install `base-devel`, `cargo`, `clang`,
+`cmake`, `git`, `openssl`, `protobuf` and `pkgconf`, then run:
+
+    makepkg -si
+
+The `PKGBUILD` uses the matching `v<version>` Git tag and the locked Cargo dependencies.
+
 ## presage and libsignal-service
 
 corvus-cli needs work that is not in presage and libsignal-service-rs yet. It is built
