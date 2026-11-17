@@ -54,6 +54,7 @@ jobs:
             cmake \
             libclang-dev \
             libssl-dev \
+            libsqlite3-dev \
             pkg-config \
             protobuf-compiler
 
@@ -206,7 +207,8 @@ jobs:
             openssl \
             protobuf \
             pkgconf \
-            shadow
+            shadow \
+            sqlite
 
       - name: Check out source
         uses: actions/checkout@v7
