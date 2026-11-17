@@ -192,6 +192,7 @@ jobs:
     # Arch packages are created for versioned releases, not for every branch push.
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     container:
       image: archlinux:base-devel
     steps:
@@ -204,7 +205,8 @@ jobs:
             git \
             openssl \
             protobuf \
-            pkgconf
+            pkgconf \
+            shadow
 
       - name: Check out source
         uses: actions/checkout@v7
