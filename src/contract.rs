@@ -13,7 +13,7 @@ use presage::model::groups::{AccessControl, Group, Member, RequestingMember};
 use presage::proto::attachment_pointer::AttachmentIdentifier;
 use presage::proto::body_range::{AssociatedValue, Style};
 use presage::proto::data_message::{quote, Delete, Flags, Quote, Reaction, Sticker, UnpinMessage, pin_message::PinDuration, PinMessage};
-use presage::proto::data_message::{PollCreate, PollTerminate, PollVote};
+use presage::proto::data_message::{contact::{Avatar as ContactAvatar, Name as ContactName, Phone as ContactPhone}, Contact, PollCreate, PollTerminate, PollVote};
 use presage::proto::receipt_message::Type as ReceiptType;
 use presage::proto::sync_message::{Content as SyncContent, Sent};
 use presage::proto::typing_message::Action;
@@ -192,6 +192,23 @@ fn cases() -> Value {
         timestamp: Some(TS),
         ..Default::default()
     };
+    let contact = DataMessage {
+        contact: vec![Contact {
+            name: Some(ContactName { given_name: Some("Alice".into()), ..Default::default() }),
+            number: vec![ContactPhone { value: Some("+49111".into()), ..Default::default() }],
+            avatar: Some(ContactAvatar {
+                avatar: Some(AttachmentPointer {
+                    attachment_identifier: Some(AttachmentIdentifier::CdnId(987654321)),
+                    content_type: Some("image/png".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        timestamp: Some(TS),
+        ..Default::default()
+    };
     let expiration = DataMessage {
         flags: Some(Flags::ExpirationTimerUpdate as u32),
         expire_timer: Some(86400),
@@ -291,6 +308,7 @@ fn cases() -> Value {
         "pollCreate": notification(BOB, ContentBody::DataMessage(poll_create)),
         "pollVote": notification(ALICE, ContentBody::DataMessage(poll_vote)),
         "pollTerminate": notification(ALICE, ContentBody::DataMessage(poll_terminate)),
+        "contact": notification(BOB, ContentBody::DataMessage(contact)),
         "expiration": notification(ALICE, ContentBody::DataMessage(expiration)),
         "voiceNote": notification(ALICE, ContentBody::DataMessage(voice)),
         "viewOnce": notification(ALICE, ContentBody::DataMessage(view_once)),

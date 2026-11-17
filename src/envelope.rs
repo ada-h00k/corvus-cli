@@ -8,7 +8,7 @@ use presage::libsignal_service::content::{Content, ContentBody, Metadata};
 use presage::libsignal_service::prelude::{GroupMasterKey, GroupSecretParams, Uuid};
 use presage::proto::attachment_pointer::AttachmentIdentifier;
 use presage::proto::data_message::{Flags, Quote, Reaction, UnpinMessage, pin_message::PinDuration, PinMessage};
-use presage::proto::data_message::{PollCreate, PollTerminate, PollVote};
+use presage::proto::data_message::{contact::{Avatar as ContactAvatar, Name as ContactName, Phone as ContactPhone}, Contact, PollCreate, PollTerminate, PollVote};
 use presage::proto::receipt_message::Type as ReceiptType;
 use presage::proto::sync_message::{Content as SyncContent, Sent};
 use presage::proto::typing_message::Action;
@@ -171,6 +171,24 @@ fn poll_terminate_json(terminate: &PollTerminate) -> Value {
     json!({"targetSentTimestamp": terminate.target_sent_timestamp})
 }
 
+/// corvus-cli's contact JSON (since 1.5.0): the Contact cards of a dataMessage.
+/// The name is the displayName (here the given name Corvus sends), the number is the
+/// first Phone entry and the avatar is reported like any attachment pointer.
+/// signal-cli has no equivalent, so Corvus sees these only via corvus-cli.
+fn contact_json(contact: &Contact) -> Value {
+    let mut out = Map::new();
+    if let Some(name) = &contact.name {
+        out.insert("name".into(), json!(name.given_name));
+    }
+    if let Some(first) = contact.number.first() {
+        out.insert("number".into(), json!(first.value));
+    }
+    if let Some(pointer) = contact.avatar.as_ref().and_then(|avatar| avatar.avatar.as_ref()) {
+        out.insert("avatar".into(), attachment_json(pointer));
+    }
+    Value::Object(out)
+}
+
 /// The members of a signal-cli dataMessage, also used inside syncMessage.sentMessage.
 fn data_message_fields(dir: &Directory, dm: &DataMessage, out: &mut Map<String, Value>) {
     out.insert("timestamp".into(), json!(dm.timestamp));
@@ -223,6 +241,12 @@ fn data_message_fields(dir: &Directory, dm: &DataMessage, out: &mut Map<String, 
     }
     if let Some(terminate) = &dm.poll_terminate {
         out.insert("pollTerminate".into(), poll_terminate_json(terminate));
+    }
+    if !dm.contact.is_empty() {
+        out.insert(
+            "contacts".into(),
+            Value::Array(dm.contact.iter().map(contact_json).collect()),
+        );
     }
     if !dm.preview.is_empty() {
         let previews: Vec<Value> = dm
@@ -546,6 +570,34 @@ mod tests {
         };
         let env = to_envelope(&dir(), &content(ContentBody::DataMessage(terminate))).unwrap();
         assert_eq!(env["dataMessage"]["pollTerminate"]["targetSentTimestamp"], 5);
+    }
+
+    #[test]
+    fn contact_card_with_avatar() {
+    let card = DataMessage {
+        contact: vec![Contact {
+            name: Some(ContactName { given_name: Some("Alice".into()), ..Default::default() }),
+            number: vec![ContactPhone { value: Some("+49111".into()), ..Default::default() }],
+            avatar: Some(ContactAvatar {
+                avatar: Some(AttachmentPointer {
+                    attachment_identifier: Some(AttachmentIdentifier::CdnId(987654321)),
+                    content_type: Some("image/png".into()),
+                    ..Default::default()
+                }),
+                is_profile: None,
+            }),
+            ..Default::default()
+        }],
+        timestamp: Some(1_700_000_000_000),
+        ..Default::default()
+    };
+        let env = to_envelope(&dir(), &content(ContentBody::DataMessage(card))).unwrap();
+        let c = &env["dataMessage"]["contacts"][0];
+        assert_eq!(c["name"], "Alice");
+        assert_eq!(c["number"], "+49111");
+        assert_eq!(c["avatar"]["contentType"], "image/png");
+        assert_eq!(c["avatar"]["id"], "987654321");
+        assert_eq!(env["dataMessage"]["message"], Value::Null);
     }
 
     #[test]

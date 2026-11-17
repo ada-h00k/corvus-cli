@@ -19,7 +19,7 @@ use presage::manager::Registered;
 use presage::model::groups::Group;
 use presage::model::messages::Received;
 use presage::proto::data_message::{quote, Delete, Flags, Quote, Reaction, UnpinMessage, pin_message::PinDuration, PinMessage};
-use presage::proto::data_message::{PollCreate, PollTerminate, PollVote};
+use presage::proto::data_message::{contact::{Avatar as ContactAvatar, Name as ContactName, Phone as ContactPhone}, Contact, PollCreate, PollTerminate, PollVote};
 use presage::proto::receipt_message::Type as ReceiptType;
 use presage::proto::sync_message::Content as SyncContent;
 use presage::proto::typing_message::Action;
@@ -924,6 +924,7 @@ impl Daemon {
             "sendPollCreate" => self.send_poll_create(p).await,
             "sendPollVote" => self.send_poll_vote(p).await,
             "sendPollTerminate" => self.send_poll_terminate(p).await,
+            "sendContact" => self.send_contact(p).await,
             "remoteDelete" => self.remote_delete(p).await,
             "sendReceipt" => self.send_receipt(p).await,
             "sendTyping" => self.send_typing(p).await,
@@ -1269,6 +1270,71 @@ impl Daemon {
             ..Default::default()
         };
         self.send_to(&targets, ContentBody::DataMessage(dm), timestamp).await
+    }
+
+    // corvus-cli 1.5.0 (extension): a contact card as a DataMessage.contact entry — the
+    // same wire format the official clients send. The name is carried as displayName in
+    // the Name sub-message, an optional phone number as the first Phone entry, and an
+    // optional avatar as an AttachmentPointer (the image is uploaded like any attachment).
+    // signal-cli cannot send or report contacts, so only Corvus understands these.
+    async fn send_contact(&self, p: &Params) -> RpcResult {
+        let targets = self.targets(p).await?;
+        let name = p.required_str("name")?.trim().to_owned();
+        if name.is_empty() {
+            return Err(RpcError::invalid("contact name must not be empty"));
+        }
+        let number = p.str("number").map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
+        let avatar = match p.str("avatar").filter(|b| !b.trim().is_empty()) {
+            Some(b64) => {
+                use base64::{prelude::BASE64_STANDARD, Engine as _};
+                let bytes = BASE64_STANDARD
+                    .decode(b64.trim())
+                    .map_err(|_| RpcError::invalid("contact avatar must be valid base64"))?;
+                if bytes.len() > 1_000_000 {
+                    return Err(RpcError::invalid("contact avatar exceeds the maximum size of 1 MB"));
+                }
+                // Staged with a matching extension so the upload derives the MIME type;
+                // the staging file itself can go away once the pointer exists.
+                let path = self
+                    .attachments_path(&format!("contact-avatar-{}.{}", now_ms(), Self::sniff_avatar_extension(&bytes)));
+                if let Err(e) = tokio::fs::write(&path, &bytes).await {
+                    return Err(RpcError::failed(format!("avatar staging failed: {e}")));
+                }
+                let uploaded = self.upload(&[path.to_string_lossy().to_string()], false).await?;
+                let _ = tokio::fs::remove_file(&path).await;
+                uploaded.into_iter().next().map(|pointer| ContactAvatar { avatar: Some(pointer), ..Default::default() })
+            }
+            None => None,
+        };
+        let timestamp = now_ms();
+        let dm = DataMessage {
+            contact: vec![Contact {
+                avatar,
+                name: Some(ContactName { given_name: Some(name), ..Default::default() }),
+                number: number
+                    .map(|n| vec![ContactPhone { value: Some(n), ..Default::default() }])
+                    .unwrap_or_default(),
+                ..Default::default()
+            }],
+            timestamp: Some(timestamp),
+            ..Default::default()
+        };
+        self.send_to(&targets, ContentBody::DataMessage(dm), timestamp).await
+    }
+
+    // Avatar images are staged with an extension matching their magic bytes.
+    fn sniff_avatar_extension(bytes: &[u8]) -> &'static str {
+        if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+            "png"
+        } else if bytes.starts_with(&[0xFF, 0xD8]) {
+            "jpg"
+        } else if bytes.starts_with(b"GIF8") {
+            "gif"
+        } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+            "webp"
+        } else {
+            "bin"
+        }
     }
 
     async fn remote_delete(&self, p: &Params) -> RpcResult {

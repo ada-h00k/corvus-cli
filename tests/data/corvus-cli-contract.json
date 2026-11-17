@@ -1,4 +1,42 @@
 {
+  "contact": {
+    "jsonrpc": "2.0",
+    "method": "receive",
+    "params": {
+      "account": "+49999",
+      "envelope": {
+        "dataMessage": {
+          "contacts": [
+            {
+              "avatar": {
+                "caption": null,
+                "contentType": "image/png",
+                "filename": null,
+                "height": null,
+                "id": "987654321",
+                "size": null,
+                "voiceNote": false,
+                "width": null
+              },
+              "name": "Alice",
+              "number": "+49111"
+            }
+          ],
+          "expiresInSeconds": 0,
+          "message": null,
+          "timestamp": 1790000000000,
+          "viewOnce": false
+        },
+        "serverReceivedTimestamp": 1790000000050,
+        "source": "22222222-2222-4222-8222-222222222222",
+        "sourceDevice": 1,
+        "sourceName": "Bob",
+        "sourceNumber": null,
+        "sourceUuid": "22222222-2222-4222-8222-222222222222",
+        "timestamp": 1790000000000
+      }
+    }
+  },
   "delete": {
     "jsonrpc": "2.0",
     "method": "receive",
