@@ -8,12 +8,12 @@ arch=('x86_64')
 url='https://github.com/ada-h00k/corvus-cli'
 license=('AGPL-3.0-only')
 depends=('gcc-libs' 'glibc' 'openssl')
-source=('corvus-cli')
+source=('corvus-cli' 'LICENSE' 'README.md')
 noextract=('corvus-cli')
-sha256sums=('SKIP')
+sha256sums=('SKIP' 'SKIP' 'SKIP')
 
 package() {
   install -Dm755 "${srcdir}/corvus-cli" "${pkgdir}/usr/bin/corvus-cli"
-  install -Dm644 "${srcdir}/${pkgname}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
-  install -Dm644 "${srcdir}/${pkgname}/README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 "${srcdir}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 "${srcdir}/README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
 }
