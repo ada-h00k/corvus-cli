@@ -156,8 +156,9 @@ impl Daemon {
                 }
             }
         }
-        let path = self.attachments_path(&received_sticker_file(pack_id, sticker_id));
-        tokio::fs::read(path).await.ok().map(|b| (b, None))
+        let name = received_sticker_file(pack_id, sticker_id);
+        let path = self.attachments_path(&name);
+        crate::daemon::read_maybe_encrypted(&path, &name, self.crypto.as_ref()).await.ok().map(|b| (b, None))
     }
 
     pub(crate) async fn get_sticker(&self, p: &Params) -> RpcResult {

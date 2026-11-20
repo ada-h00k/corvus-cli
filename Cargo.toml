@@ -26,10 +26,16 @@ futures = "0.3"
 mime_guess = "2.0"
 rand = "0.9"
 serde_json = "1.0"
-tokio = { version = "1.48", features = ["rt", "io-std", "io-util", "sync", "time", "fs"] }
+tokio = { version = "1.48", features = ["rt", "io-std", "io-util", "sync", "time", "fs", "signal"] }
 tracing = "0.1"
 # No default features: "ansi" (stderr is read by corvus, not a terminal) and "tracing-log" are not needed.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+# Encryption of the data at rest (keyring, account index, trust store, SQLite store,
+# attachments), the same primitives the GUI's history-store uses: a random master key wrapped
+# with Argon2id over the secret, XChaCha20-Poly1305 for the files.
+argon2 = { version = "0.6", default-features = false }
+chacha20 = { version = "0.10", default-features = false }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 # only used to build envelope timestamps in tests

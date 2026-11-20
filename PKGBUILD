@@ -1,7 +1,7 @@
 # Maintainer: ada-h00k
 
 pkgname=corvus-cli
-pkgver=1.4.2
+pkgver=1.6.0
 pkgrel=1
 pkgdesc='Signal backend for Corvus, compatible with signal-cli JSON-RPC'
 arch=('x86_64')

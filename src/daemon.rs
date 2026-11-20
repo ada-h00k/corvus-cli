@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
+use crate::crypto::{self, Crypto};
 use crate::envelope::{self, Directory, Person};
 use crate::groupops::ExtrasCache;
 use crate::groups;
@@ -74,7 +75,10 @@ struct TypingState {
 pub struct Daemon {
     pub(crate) manager: Mgr,
     out: mpsc::UnboundedSender<Output>,
-    attachments: PathBuf,
+    pub(crate) attachments: PathBuf,
+    /// Present when a secret unlocked the data: attachments are written encrypted (and read
+    /// encrypted, plain files of an older version still read).
+    pub(crate) crypto: Option<Crypto>,
     pub(crate) account: String,
     pub(crate) self_aci: Uuid,
     pub(crate) dir: RefCell<Directory>,
@@ -112,7 +116,12 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 impl Daemon {
-    pub async fn new(manager: Mgr, account_dir: &Path, out: mpsc::UnboundedSender<Output>) -> anyhow::Result<Rc<Self>> {
+    pub async fn new(
+        manager: Mgr,
+        account_dir: &Path,
+        out: mpsc::UnboundedSender<Output>,
+        crypto: Option<Crypto>,
+    ) -> anyhow::Result<Rc<Self>> {
         // corvus decides about link previews itself and passes them with `send` (previewUrl …);
         // presage would otherwise fetch every linked page, revealing the user's IP address to it.
         manager.set_automatic_link_previews(false);
@@ -125,10 +134,11 @@ impl Daemon {
         let daemon = Rc::new(Self {
             manager,
             out,
-            trust: RefCell::new(TrustStore::load(account_dir)),
+            trust: RefCell::new(TrustStore::load(account_dir, crypto.clone())),
             group_extras: Default::default(),
             storage_state: Default::default(),
             attachments,
+            crypto,
             account,
             self_aci,
             dir: Default::default(),
@@ -885,7 +895,9 @@ impl Daemon {
         self.attachments.join(name)
     }
 
-    /// Saves an attachment under its id, or under `name` (received stickers).
+    /// Saves an attachment under its id, or under `name` (received stickers). Encrypted when a
+    /// secret unlocked the data; without one (and on an encryption failure, which is reported)
+    /// nothing plaintext is written.
     async fn download(&self, pointer: &AttachmentPointer, name: Option<String>) {
         let Some(id) = name.or_else(|| envelope::attachment_id(pointer)) else { return };
         let path = self.attachments.join(&id);
@@ -894,7 +906,7 @@ impl Daemon {
         }
         match self.manager.get_attachment(pointer).await {
             Ok(data) => {
-                if let Err(e) = write_private(&path, &data).await {
+                if let Err(e) = save_attachment(&path, &id, &data, self.crypto.as_ref()).await {
                     warn!(%e, id, "cannot save attachment");
                 }
             }
@@ -1057,8 +1069,12 @@ impl Daemon {
     pub(crate) async fn upload(&self, paths: &[String], voice_note: bool) -> Result<Vec<AttachmentPointer>, RpcError> {
         let mut specs = Vec::new();
         for path in paths {
-            let data = tokio::fs::read(path).await.map_err(|e| RpcError::failed(format!("{path}: {e}")))?;
+            // Staged files (e.g. a contact avatar written below) are encrypted like the stored
+            // attachments; files corvus passes in are read as they are.
             let file_name = Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned());
+            let data = read_maybe_encrypted(Path::new(path), file_name.as_deref().unwrap_or(""), self.crypto.as_ref())
+                .await
+                .map_err(|e| RpcError::failed(format!("{path}: {e}")))?;
             let spec = AttachmentSpec {
                 content_type: mime_guess::from_path(path).first_or_octet_stream().to_string(),
                 length: data.len(),
@@ -1305,9 +1321,9 @@ impl Daemon {
                 }
                 // Staged with a matching extension so the upload derives the MIME type;
                 // the staging file itself can go away once the pointer exists.
-                let path = self
-                    .attachments_path(&format!("contact-avatar-{}.{}", now_ms(), Self::sniff_avatar_extension(&bytes)));
-                if let Err(e) = tokio::fs::write(&path, &bytes).await {
+                let staged = format!("contact-avatar-{}.{}", now_ms(), Self::sniff_avatar_extension(&bytes));
+                let path = self.attachments_path(&staged);
+                if let Err(e) = save_attachment(&path, &staged, &bytes, self.crypto.as_ref()).await {
                     return Err(RpcError::failed(format!("avatar staging failed: {e}")));
                 }
                 let uploaded = self.upload(&[path.to_string_lossy().to_string()], false).await?;
@@ -1463,7 +1479,9 @@ impl Daemon {
         if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
             return Err(RpcError::invalid("invalid attachment id"));
         }
-        let data = tokio::fs::read(self.attachments.join(id)).await.map_err(|_| RpcError::failed("Could not find attachment"))?;
+        let data = read_maybe_encrypted(&self.attachments.join(&id), &id, self.crypto.as_ref())
+            .await
+            .map_err(|_| RpcError::failed("Could not find attachment"))?;
         Ok(json!({"data": BASE64_STANDARD.encode(data)}))
     }
 
@@ -1592,6 +1610,30 @@ async fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
         tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
     }
     tokio::fs::rename(tmp, path).await
+}
+
+/// Reads `path` and decrypts it when it is an encrypted attachment. Plain files (written by an
+/// older version, or user files passed to `send` by corvus) are returned as they are.
+pub(crate) async fn read_maybe_encrypted(path: &Path, name: &str, crypto: Option<&Crypto>) -> anyhow::Result<Vec<u8>> {
+    let data = tokio::fs::read(path).await?;
+    match crypto {
+        Some(crypto) if Crypto::is_frame(&data) => Ok(crypto.open(crypto::purpose::ATTACH, name, &data)?),
+        _ => Ok(data),
+    }
+}
+
+/// Saves attachment bytes: encrypted when a secret is available, otherwise plain like before.
+/// On an encryption failure nothing is written — an attachment stays downloadable again
+/// (signal-cli keeps the pointer), while a plaintext copy could not be taken back.
+pub(crate) async fn save_attachment(path: &Path, name: &str, data: &[u8], crypto: Option<&Crypto>) -> anyhow::Result<()> {
+    match crypto {
+        Some(crypto) => {
+            let frame = crypto.seal(crypto::purpose::ATTACH, name, data)?;
+            write_private(path, &frame).await?;
+        }
+        None => write_private(path, data).await?,
+    }
+    Ok(())
 }
 
 

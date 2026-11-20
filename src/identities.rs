@@ -1,7 +1,8 @@
 // Safety numbers and trust, with signal-cli's default policy (trust-new-identities on-first-use):
 // the first key seen for someone is TRUSTED_UNVERIFIED; a different key later is UNTRUSTED, and
 // nothing is sent to it until the user verifies it (`trust`). presage itself trusts every key, so
-// the decision is kept here, in <account dir>/trust.json.
+// the decision is kept here, in <account dir>/trust.json — encrypted when a secret unlocked the
+// data (see crypto.rs), like everything else in the account directory.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,9 @@ use base64::prelude::*;
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::protocol::{Fingerprint, IdentityKey};
 use serde_json::{json, Value};
+use tracing::warn;
+
+use crate::crypto::{self, Crypto};
 
 /// Signal's safety number parameters (version 2: identified by ACI).
 const FINGERPRINT_VERSION: u32 = 2;
@@ -50,14 +54,30 @@ struct Accepted {
 
 pub struct TrustStore {
     path: PathBuf,
+    /// Present when a secret unlocked the data: the store is written encrypted, and the
+    /// plaintext file of an older version is still read.
+    crypto: Option<Crypto>,
     accepted: BTreeMap<Uuid, Accepted>,
 }
 
+/// The encrypted form of a trust store path (trust.json -> trust.json.enc).
+fn enc_path_of(path: &Path) -> PathBuf {
+    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".enc");
+    path.with_file_name(name)
+}
+
 impl TrustStore {
-    pub fn load(account_dir: &Path) -> Self {
+    pub fn load(account_dir: &Path, crypto: Option<Crypto>) -> Self {
         let path = account_dir.join("trust.json");
+        let enc_path = account_dir.join("trust.json.enc");
         let mut accepted = BTreeMap::new();
-        if let Ok(Value::Object(map)) = std::fs::read(&path).map_err(drop).and_then(|d| serde_json::from_slice(&d).map_err(drop)) {
+        // The encrypted store wins; the plaintext one is only read before the migration ran.
+        let bytes = match (&crypto, enc_path.exists()) {
+            (Some(crypto), true) => crypto.read_file(crypto::purpose::TRUST, "", &enc_path).ok(),
+            _ => std::fs::read(&path).ok(),
+        };
+        if let Some(Value::Object(map)) = bytes.as_deref().and_then(|d| serde_json::from_slice(d).ok()) {
             for (uuid, entry) in map {
                 let (Ok(uuid), Some(key), Some(level)) = (
                     Uuid::parse_str(&uuid),
@@ -69,7 +89,7 @@ impl TrustStore {
                 accepted.insert(uuid, Accepted { key, level, added: entry["added"].as_u64().unwrap_or(0) });
             }
         }
-        Self { path, accepted }
+        Self { path, crypto, accepted }
     }
 
     fn save(&self) {
@@ -80,10 +100,18 @@ impl TrustStore {
                 (uuid.to_string(), json!({"key": BASE64_STANDARD.encode(&a.key), "level": a.level.as_str(), "added": a.added}))
             })
             .collect();
-        let tmp = self.path.with_extension("json.tmp");
-        let written = std::fs::write(&tmp, Value::Object(map).to_string()).and_then(|()| std::fs::rename(&tmp, &self.path));
+        let data = Value::Object(map).to_string();
+        let written = match &self.crypto {
+            Some(crypto) => crypto.seal_file(crypto::purpose::TRUST, "", &enc_path_of(&self.path), data.as_bytes()),
+            None => {
+                let tmp = self.path.with_extension("json.tmp");
+                std::fs::write(&tmp, &data)
+                    .and_then(|()| std::fs::rename(&tmp, &self.path))
+                    .map_err(anyhow::Error::from)
+            }
+        };
         if let Err(e) = written {
-            tracing::warn!(%e, "cannot save trust decisions");
+            warn!(%e, "cannot save trust decisions");
         }
     }
 
@@ -156,7 +184,7 @@ mod tests {
     fn first_use_then_change_then_verify() {
         let dir = tmp();
         let alice = Uuid::from_u128(5);
-        let mut store = TrustStore::load(&dir);
+        let mut store = TrustStore::load(&dir, None);
         assert_eq!(store.level(alice, b"k1", 10).0, Level::TrustedUnverified);
         assert_eq!(store.level(alice, b"k1", 20), (Level::TrustedUnverified, 10));
         assert_eq!(store.level(alice, b"k2", 30).0, Level::Untrusted);
@@ -164,8 +192,26 @@ mod tests {
         assert_eq!(store.level(alice, b"k2", 40).0, Level::Untrusted);
         store.accept(alice, b"k2", Level::TrustedVerified, 50);
         // Kept across restarts.
-        let mut again = TrustStore::load(&dir);
+        let mut again = TrustStore::load(&dir, None);
         assert_eq!(again.level(alice, b"k2", 60), (Level::TrustedVerified, 50));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn encrypted_store_roundtrips_and_hides_the_keys() {
+        let dir = tmp();
+        let crypto = crypto::unlock(&dir, "pw", None).unwrap();
+        let alice = Uuid::from_u128(7);
+        let mut store = TrustStore::load(&dir, Some(crypto));
+        store.accept(alice, b"key-1", Level::TrustedVerified, 10);
+        assert!(dir.join("trust.json.enc").exists());
+        assert!(!dir.join("trust.json").exists());
+        // The accepted key is not readable on disk.
+        let raw = std::fs::read(dir.join("trust.json.enc")).unwrap();
+        assert!(!raw.windows(5).any(|w| w == b"key-1"));
+        // The next start (with the same secret) reads the decisions back.
+        let mut again = TrustStore::load(&dir, Some(crypto::unlock(&dir, "pw", None).unwrap()));
+        assert_eq!(again.level(alice, b"key-1", 20), (Level::TrustedVerified, 10));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

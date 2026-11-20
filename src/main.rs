@@ -3,6 +3,7 @@
 
 mod account;
 mod contract;
+mod crypto;
 mod daemon;
 mod envelope;
 mod groupops;
@@ -29,6 +30,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
+use crate::crypto::Crypto;
 use crate::store::{e164, open_store, Accounts};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -157,19 +159,39 @@ fn main() -> ExitCode {
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
-    let accounts = Accounts::new(store::data_dir(args.config.as_deref()));
+    let dir = store::data_dir(args.config.as_deref());
+    // The secret Corvus unlocked its history with (keychain entry or passphrase) also unlocks
+    // the data here. It is passed in the environment instead of the command line, where other
+    // users of the machine could read it. Without a secret the commands still run as long as
+    // nothing is encrypted yet; encrypted data without a secret is a hard error.
+    let secret = std::env::var(crypto::SECRET_ENV).ok().filter(|s| !s.is_empty());
+    let previous = std::env::var(crypto::PREVIOUS_SECRET_ENV).ok().filter(|s| !s.is_empty());
+    let crypto = match secret {
+        Some(secret) => {
+            let crypto = crypto::unlock(&dir, &secret, previous.as_deref())?;
+            // Encrypt the plaintext files an older version left behind (one-time; cheap when
+            // there is nothing to do).
+            store::migrate_legacy(&dir, &crypto)?;
+            Some(crypto)
+        }
+        None if crypto::keyring_exists(&dir) => {
+            bail!("this data is encrypted, but no secret was given ({} is not set); start through Corvus", crypto::SECRET_ENV)
+        }
+        None => None,
+    };
+    let accounts = Accounts::new(dir, crypto.clone());
     match args.command.as_deref() {
         Some("listAccounts") => list_accounts(&accounts, args.json_output),
         Some("link") => {
             let name = option(&args.rest, "-n", "--name").unwrap_or_else(|| "corvus-cli".into());
-            link(&accounts, name).await
+            link(&accounts, name, crypto).await
         }
         Some("jsonRpc") => {
             let account = match args.account {
                 Some(account) => account,
                 None => single_account(&accounts).context("No account given: use -a <number>")?,
             };
-            json_rpc(&accounts, &account).await
+            json_rpc(&accounts, &account, crypto).await
         }
         Some(other) => bail!("Command {other} is not supported by corvus-cli"),
         None => bail!("No command given (supported: link, listAccounts, jsonRpc)"),
@@ -194,7 +216,7 @@ fn list_accounts(accounts: &Accounts, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn link(accounts: &Accounts, device_name: String) -> anyhow::Result<()> {
+async fn link(accounts: &Accounts, device_name: String, crypto: Option<Crypto>) -> anyhow::Result<()> {
     let staging = accounts.staging_dir()?;
     // Keep a handle to the shared SQLite pool so it can be closed explicitly after
     // linking. Dropping the manager alone does not wait for SQLx connections to close;
@@ -232,14 +254,26 @@ async fn link(accounts: &Accounts, device_name: String) -> anyhow::Result<()> {
     // Windows keeps SQLite database/WAL files locked until the pool has fully shut down.
     store.close().await;
     accounts.register(&staging, &number, &aci)?;
+    // The freshly linked store is plaintext while linking (SQLite needs a real file); encrypt
+    // it right away so the account directory holds no readable session keys afterwards.
+    if let Some(crypto) = &crypto {
+        if let Err(e) = store::seal_db(&accounts.account_dir(&aci), crypto) {
+            warn!(%e, "cannot encrypt the freshly linked store; the next start will");
+        }
+    }
     println!("Associated with: {number}");
     Ok(())
 }
 
-async fn json_rpc(accounts: &Accounts, account: &str) -> anyhow::Result<()> {
+async fn json_rpc(accounts: &Accounts, account: &str, crypto: Option<Crypto>) -> anyhow::Result<()> {
     let dir = accounts.find(account)?;
+    // The encrypted store is decrypted to its usual path before presage opens it; a plaintext
+    // store.db3 (older version or crashed run) is used as it is and encrypted on shutdown.
+    if let Some(crypto) = &crypto {
+        store::prepare_db(&dir, crypto)?;
+    }
     let store: SqliteStore = open_store(&dir).await?;
-    let manager: Manager<SqliteStore, Registered> = Manager::load_registered(store)
+    let manager: Manager<SqliteStore, Registered> = Manager::load_registered(store.clone())
         .await
         .context("account is not linked (link it again)")?;
 
@@ -251,7 +285,7 @@ async fn json_rpc(accounts: &Accounts, account: &str) -> anyhow::Result<()> {
         }
     });
 
-    let daemon = daemon::Daemon::new(manager, &dir, out_tx.clone()).await?;
+    let daemon = daemon::Daemon::new(manager, &dir, out_tx.clone(), crypto.clone()).await?;
     daemon.start_receipt_worker();
     // Contacts' numbers and names come from the storage service: read it before the first
     // listContacts is answered (requests wait in stdin meanwhile), but not for ever.
@@ -263,7 +297,17 @@ async fn json_rpc(accounts: &Accounts, account: &str) -> anyhow::Result<()> {
     tokio::task::spawn_local(async move { profiles.prefetch_profiles().await });
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    while let Some(line) = lines.next_line().await? {
+    let mut stop = StopSignal::new();
+    loop {
+        // stdin closing stops us, and so does SIGTERM (corvus terminates the process on exit);
+        // both take the same clean shutdown, which re-encrypts the store below.
+        let line = tokio::select! {
+            line = lines.next_line() => match line? {
+                Some(line) => line,
+                None => break,
+            },
+            _ = stop.recv() => break,
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -292,11 +336,76 @@ async fn json_rpc(accounts: &Accounts, account: &str) -> anyhow::Result<()> {
             }
         });
     }
-    // stdin closed: corvus stopped us. Let queued responses go out first.
+    // stdin closed or a signal: corvus stopped us. Let queued responses go out first.
     drop(out_tx);
     drop(daemon);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), writer).await;
+    // Close the store so the write-ahead log is checkpointed and no file handle stays open
+    // (required before the plaintext database is removed; on Windows, open files cannot be
+    // unlinked). If the store does not close in time, the plaintext stays and the next start
+    // picks it up and encrypts it — no data is lost either way.
+    if tokio::time::timeout(std::time::Duration::from_secs(3), store.close()).await.is_ok() {
+        if let Some(crypto) = &crypto {
+            if let Err(e) = store::seal_db(&dir, crypto) {
+                warn!(%e, "cannot re-encrypt the store; the next start will");
+            }
+        }
+    } else {
+        warn!("the store did not close in time; leaving its plaintext for the next start to encrypt");
+    }
     Ok(())
+}
+
+/// A stop signal (SIGTERM, or Ctrl-C where corvus-cli runs interactively), registered once so
+/// it is caught while the RPC loop waits for stdin. On platforms without signals `recv` never
+/// completes: stdin closing is the stop path there.
+#[cfg(unix)]
+struct StopSignal {
+    terminate: Option<tokio::signal::unix::Signal>,
+    interrupt: Option<tokio::signal::unix::Signal>,
+}
+
+#[cfg(unix)]
+impl StopSignal {
+    fn new() -> Self {
+        // A missing stream only means this platform does not deliver the signal; stdin
+        // closing still stops the process.
+        let stream = |kind| tokio::signal::unix::signal(kind).ok();
+        Self { terminate: stream(tokio::signal::unix::SignalKind::terminate()), interrupt: stream(tokio::signal::unix::SignalKind::interrupt()) }
+    }
+
+    async fn recv(&mut self) {
+        let terminate = async {
+            match self.terminate.as_mut() {
+                Some(stream) => stream.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        let interrupt = async {
+            match self.interrupt.as_mut() {
+                Some(stream) => stream.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = terminate => {}
+            _ = interrupt => {}
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct StopSignal;
+
+#[cfg(not(unix))]
+impl StopSignal {
+    fn new() -> Self {
+        Self
+    }
+
+    async fn recv(&mut self) {
+        futures::future::pending::<()>().await;
+    }
 }
 
 /// Writes one JSON-RPC line at a time and confirms tracked notifications only after flush.
