@@ -20,7 +20,9 @@ The binary is `target/release/corvus-cli`.
 
 ## Arch Linux
 
-Versioned GitHub releases include an installable package:
+Each versioned GitHub release also includes a ready-to-use, prebuilt Linux binary, so you can
+run corvus-cli without compiling it yourself. Releases additionally include an installable
+Arch Linux package:
 
 ```sh
 sudo pacman -U corvus-cli-<version>-1-x86_64.pkg.tar.zst
