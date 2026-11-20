@@ -1,90 +1,85 @@
 # corvus-cli
 
-A Signal backend for Corvus written in Rust on [presage](https://github.com/whisperfish/presage),
-in place of the Java signal-cli. It runs the same command lines Corvus gives signal-cli
-(`--version`, `-o json listAccounts`, `link -n NAME`, `-a ACCOUNT jsonRpc`) and speaks
-signal-cli's JSON-RPC on stdin/stdout, so Corvus works with either.
+A Signal backend for Corvus, written in Rust and built on
+[presage](https://github.com/whisperfish/presage). It implements the command-line interface
+and JSON-RPC API expected by Corvus.
 
-To use it, build it (below) and choose the `corvus-cli` program in Corvus under
-Settings → Advanced → Choose …. It has its own device link: Corvus offers to link the computer
-with the phone again (the chat history in Corvus is kept).
+Build the project, then select `corvus-cli` in Corvus under
+**Settings → Advanced → Choose …**. The backend has its own device link, so the computer
+must be linked with the phone again. Existing chat history in Corvus is kept.
 
-## Building
+## Build
 
-Needs Rust 1.85+, `protoc`, and clang and cmake (libsignal's BoringSSL).
+Requirements: Rust 1.85+, `protoc`, clang and cmake (for libsignal's BoringSSL).
 
-    cargo build --release
+```sh
+cargo build --release
+```
 
 The binary is `target/release/corvus-cli`.
 
-## Arch Linux package
+## Arch Linux
 
-Each versioned GitHub release also includes an installable Arch Linux package
-(`corvus-cli-<version>-1-x86_64.pkg.tar.zst`). Install it with:
+Versioned GitHub releases include an installable package:
 
-    sudo pacman -U corvus-cli-<version>-1-x86_64.pkg.tar.zst
+```sh
+sudo pacman -U corvus-cli-<version>-1-x86_64.pkg.tar.zst
+```
 
-To build the package locally from a checkout, install `base-devel`, `cargo`, `clang`,
-`cmake`, `git`, `openssl`, `protobuf` and `pkgconf`, then run:
+To build it locally, install `base-devel`, `cargo`, `clang`, `cmake`, `git`,
+`openssl`, `protobuf` and `pkgconf`, then run:
 
-    makepkg -si
+```sh
+makepkg -si
+```
 
-The `PKGBUILD` uses the matching `v<version>` Git tag and the locked Cargo dependencies.
+The PKGBUILD uses the matching version tag and locked Cargo dependencies.
 
-## presage and libsignal-service
+## Development dependencies
 
-corvus-cli needs work that is not in presage and libsignal-service-rs yet. It is built
-against integration branches of both: presage from
-[ada-h00k/presage](https://github.com/ada-h00k/presage) (branch `corvus`: upstream plus the
-Corvus integration, including a lock that keeps sending and receiving from overwriting each
-other's session state) and
-[ada-h00k/libsignal-service-rs](https://github.com/ada-h00k/libsignal-service-rs), branch `corvus`
-(pinned by commit in Cargo.toml, as a `[patch]` for presage's dependency on it).
+The project currently uses Corvus integration branches of
+[presage](https://github.com/ada-h00k/presage) and
+[libsignal-service-rs](https://github.com/ada-h00k/libsignal-service-rs), both on the
+`corvus` branch. They contain functionality not yet available upstream and are pinned
+through the dependency configuration.
 
-To work on them, clone both forks next to this repository and add a `[patch]` section in a
-local, uncommitted change:
+For local development, clone both repositories next to this one. The presage dependency
+can be overridden in an uncommitted Cargo config:
 
-    [patch."https://github.com/ada-h00k/presage"]
-    presage = { path = "../presage/presage" }
-    presage-store-sqlite = { path = "../presage/presage-store-sqlite" }
+```toml
+[patch."https://github.com/ada-h00k/presage"]
+presage = { path = "../presage/presage" }
+presage-store-sqlite = { path = "../presage/presage-store-sqlite" }
+```
 
-They are upstream plus these open pull requests:
+## Behaviour
 
-- libsignal-service-rs #473: create and change groups
-- presage #478 (automatic link previews off), #485 (public push service), #444 (storage service
-  from a linked device), #449 (only real identity changes), #448 (create and change groups)
-
-and these additions, to be offered upstream:
-
-- libsignal-service: group permission, announcements-only and ban changes; profile avatar upload
-  (was `unimplemented!`); username reserve/confirm; storage service writes and raw record reads
-- presage: the above in `GroupEdit`, withdrawing an invitation, `set_profile` (with avatar),
-  `set_username`, sending to a group leaving out some members, a public `groups_manager`
-
-## Behaviour that follows signal-cli
-
-- Safety numbers: trust on first use; a changed key is untrusted until verified (`trust`).
-  Nothing is sent to it; group messages leave such members out and report them as
-  `IDENTITY_FAILURE`. Decisions are kept in `trust.json` in the account directory.
-- Blocking, accepting message requests, and the username are written to the storage service
-  (only the changed field of a record; fields this program doesn't know are kept), and the
-  phone is told to read it again. Messages from blocked people and groups are ignored.
-- Attachments, link preview images and stickers are downloaded when a message arrives;
+- Safety numbers use trust on first use. Changed identity keys must be verified before
+  messages are sent; group sends omit untrusted members. Decisions are stored in
+  `trust.json`.
+- Blocking, message requests and username changes are synchronized through the storage
+  service. Messages from blocked contacts and groups are ignored.
+- Incoming attachments, link-preview images and stickers are downloaded automatically;
   delivery receipts are sent for received messages.
-- Sticker packs: the packs installed on the phone are read from the storage service and
-  downloaded from the sticker CDN, so `listStickerPacks` shows them; uninstalling a pack on the
-  phone removes it here as well. `addStickerPack` installs a signal.art link (and tells the
-  phone), `getSticker` returns a sticker image, and `send` accepts `sticker: "packId:stickerId"`.
-- Link previews are only sent when Corvus asks for one (presage's automatic previews are off).
+- Sticker packs are synchronized with the phone. Packs can be installed from a
+  `signal.art` link, and stickers can be sent with `sticker: "packId:stickerId"`.
+- Link previews are generated only when requested by Corvus.
 
-Data lives in `$XDG_DATA_HOME/corvus-cli` (or `$CORVUS_CLI_DIR`), one directory per
-account. `CORVUS_CLI_LOG` sets the log filter (stderr); `-v`/`-vv` raise the level.
+Data is stored in `$XDG_DATA_HOME/corvus-cli` (or `$CORVUS_CLI_DIR`), with a directory
+per account. Set `CORVUS_CLI_LOG` to configure logging; `-v` and `-vv` increase
+verbosity.
 
 ## Tests
 
-    cargo test
+```sh
+cargo test
+```
 
-`src/contract.rs` writes the JSON corvus-cli emits to `tests/data/corvus-cli-contract.json`
-(`CORVUS_UPDATE_CONTRACT=1 cargo test`). Corvus keeps a copy of this file and its
-`tests/backend_contract_test.cpp` checks that Corvus' parsers read it as intended, so after a
-change that alters the JSON, copy the regenerated file into the Corvus repository.
+To regenerate the JSON contract fixture:
+
+```sh
+CORVUS_UPDATE_CONTRACT=1 cargo test
+```
+
+Copy the updated `tests/data/corvus-cli-contract.json` into the Corvus repository so
+its backend contract test can verify the parser against the new output.
