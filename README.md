@@ -18,11 +18,15 @@ cargo build --release
 
 The binary is `target/release/corvus-cli`.
 
+## Linux binary
+
+Each versioned GitHub release includes a ready-to-use, prebuilt Linux binary. Download it from
+[GitHub Releases](https://github.com/ada-h00k/corvus-cli/releases) and run it without compiling
+from source.
+
 ## Arch Linux
 
-Each versioned GitHub release also includes a ready-to-use, prebuilt Linux binary, so you can
-run corvus-cli without compiling it yourself. Releases additionally include an installable
-Arch Linux package:
+Versioned GitHub releases also include an installable Arch Linux package:
 
 ```sh
 sudo pacman -U corvus-cli-<version>-1-x86_64.pkg.tar.zst
