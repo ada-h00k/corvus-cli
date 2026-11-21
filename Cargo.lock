@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "corvus-cli"
-version = "1.6.8"
+version = "1.7.0"
 dependencies = [
  "anyhow",
  "argon2 0.6.0",
