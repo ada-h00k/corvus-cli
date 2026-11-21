@@ -288,7 +288,7 @@ jobs:
         # from the matched paths.
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject_path: release-assets/*
+          subject-path: release-assets/*
 
       - name: Generate checksums
         run: |
