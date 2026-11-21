@@ -16,9 +16,11 @@ path = "src/main.rs"
 # needs and corvus' own additions, see README.md. It resolves libsignal-service from the fork's
 # contact-aci branch (ac4671b plus the EmbeddedContact aciBinary field), which corvus-cli 1.6.0
 # sends and reads so the recipient can message a UUID-only contact.
+# Pinned by revision (L4): a branch moves, and any cargo update would silently pull whatever it
+# points to that day. Cargo.lock records the same commit.
 # cdsi: contact discovery, to find a phone number nobody synced (libsignal-net, BoringSSL)
-presage = { git = "https://github.com/ada-h00k/presage", branch = "corvus", features = ["cdsi"] }
-presage-store-sqlite = { git = "https://github.com/ada-h00k/presage", branch = "corvus", features = ["cdsi"] }
+presage = { git = "https://github.com/ada-h00k/presage", rev = "6588d44696ce3efbb6a0b2a5efbe423903f4ee25", features = ["cdsi"] }
+presage-store-sqlite = { git = "https://github.com/ada-h00k/presage", rev = "6588d44696ce3efbb6a0b2a5efbe423903f4ee25", features = ["cdsi"] }
 
 anyhow = "1.0"
 base64 = "0.23"

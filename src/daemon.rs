@@ -2047,10 +2047,7 @@ async fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let mut options = tokio::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+    options.mode(0o600);
     {
         use tokio::io::AsyncWriteExt as _;
         let mut f = options.open(&tmp).await?;
