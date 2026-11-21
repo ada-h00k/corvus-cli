@@ -162,13 +162,18 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let dir = store::data_dir(args.config.as_deref());
     // The secret Corvus unlocked its history with (keychain entry or passphrase) also unlocks
     // the data here. It is passed in the environment instead of the command line, where other
-    // users of the machine could read it. Without a secret the commands still run as long as
-    // nothing is encrypted yet; encrypted data without a secret is a hard error.
-    let secret = std::env::var(crypto::SECRET_ENV).ok().filter(|s| !s.is_empty());
-    let previous = std::env::var(crypto::PREVIOUS_SECRET_ENV).ok().filter(|s| !s.is_empty());
-    let crypto = match secret {
+    // users of the machine could read it; the variables are removed and their contents wiped
+    // right after reading (L2), so the secret does not stay in /proc/<pid>/environ for the
+    // life of the process or leak into child processes. This runs before anything is spawned,
+    // on one thread. Without a secret the commands still run as long as nothing is encrypted
+    // yet; encrypted data without a secret is a hard error.
+    let mut secret = std::env::var(crypto::SECRET_ENV).ok().filter(|s| !s.is_empty());
+    let mut previous = std::env::var(crypto::PREVIOUS_SECRET_ENV).ok().filter(|s| !s.is_empty());
+    std::env::remove_var(crypto::SECRET_ENV);
+    std::env::remove_var(crypto::PREVIOUS_SECRET_ENV);
+    let crypto = match secret.as_deref() {
         Some(secret) => {
-            let crypto = crypto::unlock(&dir, &secret, previous.as_deref())?;
+            let crypto = crypto::unlock(&dir, secret, previous.as_deref())?;
             // Encrypt the plaintext files an older version left behind (one-time; cheap when
             // there is nothing to do).
             store::migrate_legacy(&dir, &crypto)?;
@@ -179,6 +184,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
         }
         None => None,
     };
+    if let Some(secret) = secret.as_mut() {
+        crypto::wipe_str(secret);
+    }
+    if let Some(previous) = previous.as_mut() {
+        crypto::wipe_str(previous);
+    }
     let accounts = Accounts::new(dir, crypto.clone());
     match args.command.as_deref() {
         Some("listAccounts") => list_accounts(&accounts, args.json_output),
