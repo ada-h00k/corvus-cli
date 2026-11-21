@@ -830,6 +830,13 @@ impl Daemon {
             // Like signal-cli: messages from blocked people and groups are ignored.
             debug!("ignoring a message from a blocked contact or group");
             return false;
+        } else if !self.group_message_allowed(sender, &content.body).await {
+            // Like signal-cli and the official clients: a group message is only shown when the
+            // sender is a member of the group it names (F3). Everything in the group context is
+            // sender-controlled, and the master key leaks with every invite link — without this
+            // check, a removed member could keep posting into the group as far as Corvus sees.
+            debug!(sender = %sender, "dropping a group message from someone who is not in the group");
+            return false;
         }
         self.ensure_person(sender).await;
         if sender != self.self_aci {
@@ -920,6 +927,42 @@ impl Daemon {
             _ => None,
         };
         ctx?.master_key.as_deref()?.try_into().ok()
+    }
+
+    /// Whether a group message may be shown: only when the sender is a member of the group it
+    /// names (security review F3). presage upserts the group the message's master key names
+    /// from the server before the content reaches this function, so a message in a group we
+    /// belong to always finds it here; pending or requesting members are allowed only while
+    /// the message carries a group change (their join announcement). An unknown group cannot
+    /// prove membership and is dropped, like signal-cli and the official clients do.
+    async fn group_message_allowed(&self, sender: Uuid, body: &ContentBody) -> bool {
+        match body {
+            // Typing carries the 16-byte group identifier, not the master key; only groups we
+            // know (and whose state is in the store) can be checked. A 1:1 typing indicator
+            // has no group and is always allowed.
+            ContentBody::TypingMessage(t) => {
+                let Some(id) = t.group_id.as_deref().map(|g| BASE64_STANDARD.encode(g)) else { return true };
+                let Some(key) = self.group_keys.borrow().get(&id).copied() else { return false };
+                matches!(
+                    self.store().group(key).await,
+                    Ok(Some(group)) if group_member_or_pending(&group, sender, false)
+                )
+            }
+            _ => {
+                let Some(key) = self.group_of(body) else { return true };
+                let change = match body {
+                    ContentBody::DataMessage(dm) => group_change_present(dm.group_v2.as_ref()),
+                    ContentBody::EditMessage(EditMessage { data_message: Some(dm), .. }) => {
+                        group_change_present(dm.group_v2.as_ref())
+                    }
+                    _ => false,
+                };
+                matches!(
+                    self.store().group(key).await,
+                    Ok(Some(group)) if group_member_or_pending(&group, sender, change)
+                )
+            }
+        }
     }
 
     pub(crate) fn attachments_path(&self, name: &str) -> PathBuf {
@@ -1729,6 +1772,22 @@ fn message_timestamp(body: &ContentBody) -> Option<u64> {
     }
 }
 
+/// Whether the message's group context announces a group change.
+fn group_change_present(ctx: Option<&GroupContextV2>) -> bool {
+    ctx.and_then(|c| c.group_change.as_ref()).is_some_and(|c| !c.is_empty())
+}
+
+/// Whether `sender` is a member of `group` (F3). A pending or requesting member may only send
+/// while a group change is present: that is their join announcement, which other members need
+/// to see; any other message from them is not theirs to send yet.
+fn group_member_or_pending(group: &Group, sender: Uuid, change: bool) -> bool {
+    let member = group.members.iter().any(|m| Uuid::from(m.aci) == sender);
+    let pending = change
+        && (group.pending_members.iter().any(|m| m.uuid == sender)
+            || group.requesting_members.iter().any(|m| Uuid::from(m.aci) == sender));
+    member || pending
+}
+
 /// Which stored attachment files belong to which message, so a remote delete can remove them
 /// (security review F1). Corvus calls deleteAttachment when a message expires, is deleted or
 /// a view-once was opened; this index covers remote deletes, which arrive without any RPC.
@@ -1908,8 +1967,7 @@ mod attachment_index_tests {
     use super::*;
     use crate::crypto;
 
-    fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("corvus-cli-attach-{}-{name}", std::process::id()));
+    fn tmp(name: &str) -> PathBuf {        let dir = std::env::temp_dir().join(format!("corvus-cli-attach-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1962,5 +2020,79 @@ mod attachment_index_tests {
         assert!(!valid_attachment_id("../secret"));
         assert!(!valid_attachment_id("a/b"));
         assert!(!valid_attachment_id("a.b"));
+    }
+}
+
+#[cfg(test)]
+mod group_membership_tests {
+    use super::*;
+    use presage::libsignal_service::groups_v2::Role;
+    use presage::libsignal_service::prelude::ProfileKey;
+    use presage::model::groups::{Member, PendingMember, RequestingMember};
+
+    const ALICE: Uuid = Uuid::from_u128(0x1111_1111_1111_4111_8111_1111_1111_1111);
+    const BOB: Uuid = Uuid::from_u128(0x2222_2222_2222_4222_8222_2222_2222_2222);
+
+    /// A group with ALICE as its only full member.
+    fn group(pending: &[Uuid], requesting: &[Uuid]) -> Group {
+        Group {
+            title: "Team".into(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            revision: 3,
+            members: vec![Member {
+                aci: ALICE.into(),
+                role: Role::Default,
+                profile_key: ProfileKey::create([0; 32]),
+                joined_at_revision: 0,
+                label: None,
+                label_emoji: None,
+            }],
+            pending_members: pending
+                .iter()
+                .map(|uuid| PendingMember {
+                    uuid: *uuid,
+                    service_id_type: presage::model::ServiceIdType::AccountIdentity,
+                    role: Role::Default,
+                    added_by_aci: ALICE.into(),
+                    timestamp: 1,
+                })
+                .collect(),
+            requesting_members: requesting
+                .iter()
+                .map(|uuid| RequestingMember { aci: (*uuid).into(), profile_key: ProfileKey::create([0; 32]), timestamp: 1 })
+                .collect(),
+            invite_link_password: vec![9; 16],
+            description: None,
+        }
+    }
+
+    #[test]
+    fn only_members_may_send() {
+        let group = group(&[], &[]);
+        // A member may send; anyone else — removed member, invite-link holder — may not (F3).
+        assert!(group_member_or_pending(&group, ALICE, false));
+        assert!(!group_member_or_pending(&group, BOB, false));
+    }
+
+    #[test]
+    fn pending_and_requesting_members_only_during_a_change() {
+        let group = group(&[BOB], &[BOB]);
+        // Their join announcement carries a group change and must reach the members.
+        assert!(group_member_or_pending(&group, BOB, true));
+        // Everything else from a not-yet-member is dropped.
+        assert!(!group_member_or_pending(&group, BOB, false));
+    }
+
+    #[test]
+    fn a_group_change_is_recognised() {
+        // The group change travels as its serialized bytes.
+        let empty = GroupContextV2 { master_key: Some([7; 32].to_vec()), revision: Some(3), group_change: None };
+        let mut announced = empty.clone();
+        announced.group_change = Some(vec![1, 2, 3]);
+        assert!(!group_change_present(Some(&empty)));
+        assert!(group_change_present(Some(&announced)));
+        assert!(!group_change_present(None));
     }
 }
