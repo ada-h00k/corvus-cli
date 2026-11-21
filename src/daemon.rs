@@ -195,7 +195,7 @@ impl Daemon {
         // store's copy goes now (F1), and with it the attachments no one cleaned up.
         daemon.purge_messages().await;
         daemon.sweep_old_attachments().await;
-        rename_legacy_sticker_files(&daemon.attachments).await;
+        rename_legacy_sticker_files(&daemon.attachments, daemon.crypto.as_ref()).await;
         Ok(daemon)
     }
 
@@ -1901,10 +1901,15 @@ fn sticker_pointers(body: &ContentBody) -> Vec<(AttachmentPointer, String)> {
         .collect()
 }
 
-/// Renames the sticker files the first F5 fix wrote as "sticker-<id>": getAttachment serves
+/// Migrates the sticker files the first F5 fix wrote as "sticker-<id>": getAttachment serves
 /// "<id>", so received stickers of packs that are not installed could not be fetched at all
 /// (the follow-up fix stores the plain id). One-time at startup; cheap when nothing matches.
-async fn rename_legacy_sticker_files(dir: &Path) {
+///
+/// The file name is part of an encrypted frame's authenticated data, so a plain rename would
+/// leave every migrated file undecryptable: the frame is opened under the old name and
+/// re-sealed under the new one instead. A frame that does not open under the old name is left
+/// alone (it may already have been migrated by an interrupted run, or it is not ours).
+async fn rename_legacy_sticker_files(dir: &Path, crypto: Option<&Crypto>) {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else { return };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name();
@@ -1914,8 +1919,33 @@ async fn rename_legacy_sticker_files(dir: &Path) {
         if !valid_attachment_id(rest) || dir.join(rest).exists() {
             continue;
         }
-        if let Err(e) = tokio::fs::rename(entry.path(), dir.join(rest)).await {
-            debug!(%e, id = rest, "cannot rename a legacy sticker file");
+        let Ok(data) = tokio::fs::read(entry.path()).await else { continue };
+        match crypto {
+            Some(crypto) => {
+                let Ok(plain) = crypto.open(crypto::purpose::ATTACH, name.to_str().unwrap_or_default(), &data) else {
+                    debug!(id = rest, "cannot decrypt a legacy sticker file; leaving it alone");
+                    continue;
+                };
+                let Ok(frame) = crypto.seal(crypto::purpose::ATTACH, rest, &plain) else {
+                    debug!(id = rest, "cannot re-seal a legacy sticker file");
+                    continue;
+                };
+                if let Err(e) = write_private(&dir.join(rest), &frame).await {
+                    // The new file goes into place before the old one is removed, so an
+                    // interrupted migration only leaves a duplicate, never a gap.
+                    debug!(%e, id = rest, "cannot re-seal a legacy sticker file");
+                    continue;
+                }
+            }
+            None => {
+                if let Err(e) = tokio::fs::rename(entry.path(), dir.join(rest)).await {
+                    debug!(%e, id = rest, "cannot rename a legacy sticker file");
+                    continue;
+                }
+            }
+        }
+        if let Err(e) = tokio::fs::remove_file(entry.path()).await {
+            debug!(%e, id = rest, "cannot remove the migrated legacy sticker file");
         }
     }
 }
@@ -2446,13 +2476,37 @@ mod received_sticker_tests {
         std::fs::write(dir.join("ee11-22"), b"target").unwrap();
         std::fs::write(dir.join("sticker-ee11-22"), b"legacy").unwrap();
         std::fs::write(dir.join("keep.webp"), b"plain").unwrap();
-        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(rename_legacy_sticker_files(&dir));
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(rename_legacy_sticker_files(&dir, None));
         assert!(!dir.join("sticker-ab_c-d9").exists());
         assert_eq!(std::fs::read(dir.join("ab_c-d9")).unwrap(), b"old");
         assert!(dir.join("sticker-planted*").exists());
         assert_eq!(std::fs::read(dir.join("ee11-22")).unwrap(), b"target");
         assert!(dir.join("sticker-ee11-22").exists());
         assert!(dir.join("keep.webp").exists());
+    }
+
+    #[test]
+    fn legacy_sticker_frames_are_re_sealed_under_the_attachment_id() {
+        // The file name is part of an encrypted frame's authenticated data: a plain rename
+        // would leave every migrated file undecryptable, so the migration re-seals (F5
+        // follow-up). After the migration the frame opens under the new name and the old file
+        // is gone.
+        let dir = tmp("sticker-reseal");
+        let keyring = tmp("sticker-reseal-keyring");
+        let crypto = crypto::unlock(&keyring, "pw", None).unwrap();
+        std::fs::write(
+            dir.join("sticker-ab_c-d9"),
+            crypto.seal(crypto::purpose::ATTACH, "sticker-ab_c-d9", b"image bytes").unwrap(),
+        )
+        .unwrap();
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(rename_legacy_sticker_files(&dir, Some(&crypto)));
+        assert!(!dir.join("sticker-ab_c-d9").exists());
+        let frame = std::fs::read(dir.join("ab_c-d9")).unwrap();
+        assert_eq!(crypto.open(crypto::purpose::ATTACH, "ab_c-d9", &frame).unwrap(), b"image bytes");
+        // The old binding no longer accepts the frame either way: the name in it changed.
+        assert!(crypto.open(crypto::purpose::ATTACH, "sticker-ab_c-d9", &frame).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(keyring).unwrap();
     }
 }
 
