@@ -2,7 +2,7 @@
 // methods corvus calls. Everything runs on one thread (presage's store futures are !Send).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -104,6 +104,9 @@ pub struct Daemon {
     /// Sticker pack downloads are serialised: every storage change triggers a sync, and two of
     /// them would download the same packs twice.
     pub(crate) pack_sync: Mutex<()>,
+    /// Which stored attachment files belong to which message, so remote deletes can remove
+    /// them (security review F1).
+    attachment_index: RefCell<AttachmentIndex>,
 }
 
 pub(crate) enum Target {
@@ -130,6 +133,7 @@ impl Daemon {
         let self_aci = Uuid::from(data.service_ids.aci());
         let attachments = attachments_dir(account_dir);
         private_dir(&attachments)?;
+        let attachment_index = AttachmentIndex::load(account_dir, crypto.as_ref());
         let (receipt_tx, receipt_rx) = mpsc::unbounded_channel();
         let daemon = Rc::new(Self {
             manager,
@@ -152,9 +156,14 @@ impl Daemon {
             typing_state: Default::default(),
             decryption_reset_retry_at: Default::default(),
             pack_sync: Mutex::new(()),
+            attachment_index: RefCell::new(attachment_index),
         });
         daemon.reload_directory().await;
         daemon.reload_groups().await;
+        // presage stored every message it ever handled; Corvus keeps the history, so the
+        // store's copy goes now (F1), and with it the attachments no one cleaned up.
+        daemon.purge_messages().await;
+        daemon.sweep_old_attachments().await;
         Ok(daemon)
     }
 
@@ -619,6 +628,8 @@ impl Daemon {
                 }
             }
         }
+        // presage stored a sent transcript for every send; it must not linger either (F1).
+        self.purge_messages().await;
         Ok(json!({"timestamp": timestamp, "results": results}))
     }
 
@@ -846,11 +857,21 @@ impl Daemon {
             _ => {}
         }
         // Like signal-cli: attachments are downloaded before the message is announced.
-        for pointer in pointers {
-            self.download(&pointer, None).await;
+        for pointer in &pointers {
+            self.download(pointer, None).await;
         }
-        for (pointer, name) in sticker_pointers(&content.body) {
-            self.download(&pointer, Some(name)).await;
+        let stickers = sticker_pointers(&content.body);
+        for (pointer, name) in &stickers {
+            self.download(pointer, Some(name.clone())).await;
+        }
+        // A remote delete removes the message in Corvus; the files of its attachments must go
+        // too (F1). The index below remembers which stored files belonged to which message.
+        if let Some(timestamp) = remote_delete_target(&content.body) {
+            for id in self.attachment_index.borrow_mut().take(sender, timestamp).unwrap_or_default() {
+                if let Err(e) = tokio::fs::remove_file(self.attachments.join(&id)).await {
+                    debug!(%e, id, "cannot remove the attachment of a remotely deleted message");
+                }
+            }
         }
         let envelope = envelope::to_envelope(&self.dir.borrow(), content);
         if let Some(envelope) = envelope {
@@ -859,6 +880,16 @@ impl Daemon {
                 return false;
             }
         }
+        // The notification reached Corvus (or the message stays unacknowledged and Signal
+        // delivers it again): presage's own copy of the message has served its purpose. Corvus
+        // keeps the history, so the store must not become a second, never-pruned copy of every
+        // message (F1) — only which files belong to which message is kept, for remote deletes.
+        let mut ids: Vec<String> = pointers.iter().filter_map(envelope::attachment_id).collect();
+        ids.extend(stickers.iter().map(|(_, name)| name.clone()));
+        if let Some(timestamp) = message_timestamp(&content.body).filter(|_| !ids.is_empty()) {
+            self.attachment_index.borrow_mut().remember(sender, timestamp, ids);
+        }
+        self.purge_messages().await;
         true
     }
 
@@ -914,6 +945,63 @@ impl Daemon {
         }
     }
 
+    /// Clears presage's own copy of the message history (F1). Corvus keeps the history; the
+    /// store must not become a second, never-pruned copy of every message, attachment and
+    /// edit. presage itself only reads old messages to apply edits and remote deletes to its
+    /// own copy — which is removed here right away anyway, before Corvus has anything to
+    /// apply them to.
+    async fn purge_messages(&self) {
+        let mut store = self.store().clone();
+        if let Err(e) = store.clear_messages().await {
+            warn!(%e, "cannot clear presage's stored message history");
+        }
+    }
+
+    /// Backstop for F1: attachments of messages that expired, were deleted or were opened
+    /// view-once are removed actively (deleteAttachment RPC, remote deletes); files that no
+    /// one asked for in this many days are swept at startup, so the folder cannot grow for
+    /// ever. Corvus keeps the message history — a file it still serves after the sweep
+    /// cannot be fetched again.
+    async fn sweep_old_attachments(&self) {
+        const SWEEP_AFTER_DAYS: u64 = 30;
+        let cutoff = now_ms().saturating_sub(SWEEP_AFTER_DAYS.saturating_mul(86_400_000));
+        let Ok(mut entries) = tokio::fs::read_dir(&self.attachments).await else { return };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Ok(meta) = entry.metadata().await else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            // 0 means "unknown modification time"; such a file is kept.
+            if modified != 0 && modified < cutoff {
+                if let Err(e) = tokio::fs::remove_file(entry.path()).await {
+                    debug!(%e, id = %entry.file_name().to_string_lossy(), "cannot sweep an old attachment");
+                }
+            }
+        }
+    }
+
+    /// Removes a stored attachment file (Corvus calls this when a message expires, is deleted
+    /// or a view-once was opened — see the security review, F1).
+    async fn delete_attachment(&self, p: &Params) -> RpcResult {
+        let id = p.required_str("id")?;
+        if !valid_attachment_id(id) {
+            return Err(RpcError::invalid("invalid attachment id"));
+        }
+        match tokio::fs::remove_file(self.attachments.join(id)).await {
+            Ok(()) => Ok(json!({})),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(RpcError::failed("Could not find attachment"))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     async fn emit(&self, value: Value) -> bool {
         let (written_tx, written_rx) = oneshot::channel();
         if self.out.send(Output { value, written: Some(written_tx) }).is_err() {
@@ -941,6 +1029,7 @@ impl Daemon {
             "sendReceipt" => self.send_receipt(p).await,
             "sendTyping" => self.send_typing(p).await,
             "getAttachment" => self.get_attachment(p).await,
+            "deleteAttachment" => self.delete_attachment(p).await,
             "getAvatar" => self.get_avatar(p).await,
             "updateContact" => self.update_contact(p).await,
             "listIdentities" => self.list_identities(p).await,
@@ -1601,6 +1690,130 @@ fn collect_pointers(dm: &DataMessage, out: &mut Vec<AttachmentPointer>) {
     out.extend(dm.preview.iter().filter_map(|p| p.image.clone()));
 }
 
+/// Only file-name-safe ids are stored under attachments/ and served by getAttachment.
+pub(crate) fn valid_attachment_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The timestamp a remote delete points at, if this message is one.
+fn remote_delete_target(body: &ContentBody) -> Option<u64> {
+    match body {
+        ContentBody::DataMessage(dm) => dm.delete.as_ref().and_then(|d| d.target_sent_timestamp),
+        ContentBody::SynchronizeMessage(sync) => match &sync.content {
+            Some(SyncContent::Sent(sent)) => sent
+                .message
+                .as_ref()
+                .and_then(|dm| dm.delete.as_ref())
+                .and_then(|d| d.target_sent_timestamp),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The timestamp of the message itself (the attachment index is keyed by sender and timestamp).
+fn message_timestamp(body: &ContentBody) -> Option<u64> {
+    match body {
+        ContentBody::DataMessage(dm) => dm.timestamp,
+        ContentBody::EditMessage(EditMessage { data_message: Some(dm), .. }) => dm.timestamp,
+        ContentBody::SynchronizeMessage(sync) => match &sync.content {
+            Some(SyncContent::Sent(sent)) => sent
+                .edit_message
+                .as_ref()
+                .and_then(|e| e.data_message.as_ref())
+                .and_then(|dm| dm.timestamp)
+                .or_else(|| sent.message.as_ref().and_then(|dm| dm.timestamp)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Which stored attachment files belong to which message, so a remote delete can remove them
+/// (security review F1). Corvus calls deleteAttachment when a message expires, is deleted or
+/// a view-once was opened; this index covers remote deletes, which arrive without any RPC.
+/// It is kept small: entries expire after 30 days, and the file lives in the account
+/// directory, encrypted when a secret unlocked the data.
+struct AttachmentIndex {
+    /// "<sender uuid>:<message timestamp>" -> (added at, attachment/sticker file ids)
+    entries: BTreeMap<String, (u64, Vec<String>)>,
+    path: PathBuf,
+    crypto: Option<Crypto>,
+}
+
+impl AttachmentIndex {
+    const NAME: &str = "attachments-index.json";
+    const MAX_AGE_MS: u64 = 30 * 86_400_000;
+    const MAX_ENTRIES: usize = 512;
+
+    fn load(account_dir: &Path, crypto: Option<&Crypto>) -> Self {
+        let path = account_dir.join(Self::NAME);
+        let entries = match crypto {
+            Some(crypto) => match crypto.read_file(crypto::purpose::ATTACH, Self::NAME, &path) {
+                Ok(data) => parse_index(&data),
+                Err(e) if path.exists() => {
+                    warn!(%e, "cannot read the attachment index; remote deletes will not free their files");
+                    Default::default()
+                }
+                Err(_) => Default::default(),
+            },
+            None => std::fs::read(&path).map(|data| parse_index(&data)).unwrap_or_default(),
+        };
+        Self { entries, path, crypto: crypto.cloned() }
+    }
+
+    fn remember(&mut self, sender: Uuid, timestamp: u64, ids: Vec<String>) {
+        if timestamp == 0 || ids.is_empty() {
+            return;
+        }
+        let now = now_ms();
+        self.entries.retain(|_, (added, _)| now.saturating_sub(*added) < Self::MAX_AGE_MS);
+        self.entries.insert(format!("{sender}:{timestamp}"), (now, ids));
+        while self.entries.len() > Self::MAX_ENTRIES {
+            self.entries.pop_first();
+        }
+        self.save();
+    }
+
+    /// Removes (and returns) the stored ids of a deleted message.
+    fn take(&mut self, sender: Uuid, timestamp: u64) -> Option<Vec<String>> {
+        let ids = self.entries.remove(&format!("{sender}:{timestamp}")).map(|(_, ids)| ids);
+        if ids.is_some() {
+            self.save();
+        }
+        ids
+    }
+
+    fn save(&self) {
+        let mut map = serde_json::Map::new();
+        for (key, (added, ids)) in &self.entries {
+            map.insert(key.clone(), json!({"added": added, "ids": ids}));
+        }
+        let data = Value::Object(map).to_string();
+        let written = match &self.crypto {
+            Some(crypto) => crypto.seal_file(crypto::purpose::ATTACH, Self::NAME, &self.path, data.as_bytes()),
+            // Plaintext mode: before any secret unlocked this data (see crypto.rs).
+            None => crate::store::write_private_file(&self.path, data.as_bytes()).map_err(anyhow::Error::from),
+        };
+        if let Err(e) = written {
+            warn!(%e, "cannot save the attachment index");
+        }
+    }
+}
+
+fn parse_index(data: &[u8]) -> BTreeMap<String, (u64, Vec<String>)> {
+    let mut out = BTreeMap::new();
+    if let Some(Value::Object(map)) = serde_json::from_slice(data).ok() {
+        for (key, value) in map {
+            let ids = value["ids"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect::<Vec<String>>());
+            if let (Some(ids), Some(added)) = (ids, value["added"].as_u64()) {
+                out.insert(key, (added, ids));
+            }
+        }
+    }
+    out
+}
+
 async fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("part");
     tokio::fs::write(&tmp, data).await?;
@@ -1687,5 +1900,67 @@ mod receipt_queue_tests {
             session_reset_backoff("network unavailable"),
             Duration::from_secs(60)
         );
+    }
+}
+
+#[cfg(test)]
+mod attachment_index_tests {
+    use super::*;
+    use crate::crypto;
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("corvus-cli-attach-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    const SENDER: Uuid = Uuid::from_u128(0x4444_4444_4444_4444_8444_4444_4444_4444);
+
+    #[test]
+    fn remembers_takes_and_persists_ids() {
+        let dir = tmp("roundtrip");
+        let mut index = AttachmentIndex::load(&dir, None);
+        // Nothing is known about a message that was never seen.
+        assert!(index.take(SENDER, 1).is_none());
+        index.remember(SENDER, 1, vec!["a1".into(), "a2".into()]);
+        // A restart reads the same entries back (plaintext mode: no secret, plain file).
+        let mut again = AttachmentIndex::load(&dir, None);
+        assert_eq!(again.take(SENDER, 1).unwrap(), ["a1", "a2"]);
+        // take removes the entry: a second delete finds nothing.
+        assert!(again.take(SENDER, 1).is_none());
+        // Messages without timestamp or without attachments are not recorded.
+        index.remember(SENDER, 0, vec!["x".into()]);
+        index.remember(SENDER, 2, vec![]);
+        let mut fresh = AttachmentIndex::load(&dir, None);
+        assert!(fresh.take(SENDER, 0).is_none());
+        assert!(fresh.take(SENDER, 2).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_stored_index_is_encrypted_with_the_rest_of_the_data() {
+        let dir = tmp("encrypted");
+        let crypto = crypto::unlock(&dir, "pw", None).unwrap();
+        let mut index = AttachmentIndex::load(&dir, Some(&crypto));
+        index.remember(SENDER, 5, vec!["file1".into()]);
+        assert!(dir.join("attachments-index.json.enc").exists());
+        assert!(!dir.join("attachments-index.json").exists());
+        // The ids are not readable on disk.
+        let raw = std::fs::read(dir.join("attachments-index.json.enc")).unwrap();
+        assert!(!raw.windows(5).any(|w| w == b"file1"));
+        // And a restart (with the same secret) reads them back.
+        let mut again = AttachmentIndex::load(&dir, Some(&crypto::unlock(&dir, "pw", None).unwrap()));
+        assert_eq!(again.take(SENDER, 5).unwrap(), ["file1"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_file_name_safe_ids_are_valid() {
+        assert!(valid_attachment_id("a-b_C9"));
+        assert!(!valid_attachment_id(""));
+        assert!(!valid_attachment_id("../secret"));
+        assert!(!valid_attachment_id("a/b"));
+        assert!(!valid_attachment_id("a.b"));
     }
 }

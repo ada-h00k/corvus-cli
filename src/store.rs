@@ -296,7 +296,7 @@ fn wipe_and_remove(path: &Path) {
 }
 
 /// Writes a file readable only by the user, through a temp file + rename.
-fn write_private_file(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_private_file(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     let tmp = path.with_extension("part");
     {
         let mut o = fs::OpenOptions::new();
