@@ -188,7 +188,7 @@ jobs:
       - name: Check dependencies for known advisories
         if: runner.os == 'Linux'
         run: |
-          cargo install cargo-audit --locked --version 0.23
+          cargo install cargo-audit --locked --version '=0.23.0'
           cargo audit
 
       - name: Build release binary
