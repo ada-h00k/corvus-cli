@@ -321,6 +321,15 @@ fn header(dir: &Directory, meta: &Metadata) -> Map<String, Value> {
     env
 }
 
+/// Marks an envelope as coming from an identity the user has not accepted (a changed safety
+/// number, L6): sends to it are blocked, and with the mark Corvus can warn about the incoming
+/// side too, when the message arrives.
+pub fn set_untrusted(envelope: &mut Value) {
+    if let Value::Object(env) = envelope {
+        env.insert("untrustedIdentity".into(), json!(true));
+    }
+}
+
 /// The envelope for one received message, or None for content corvus has no use for
 /// (null messages, calls, stories, decryption error reports, unhandled sync messages).
 pub fn to_envelope(dir: &Directory, content: &Content) -> Option<Value> {

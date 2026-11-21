@@ -902,9 +902,10 @@ impl Daemon {
             return false;
         }
         self.ensure_person(sender).await;
-        if sender != self.self_aci {
-            self.trust_level(sender).await; // remembers a first key (trust on first use)
-        }
+        // Trust on first use: the first key is remembered as unverified; a changed one stays
+        // untrusted until the user accepts it (L6).
+        let untrusted_identity =
+            sender != self.self_aci && self.trust_level(sender).await.map(|t| t.1) == Some(Level::Untrusted);
         let mut pointers = Vec::new();
         match &content.body {
             ContentBody::DataMessage(dm) => {
@@ -966,6 +967,12 @@ impl Daemon {
             }
         }
         let envelope = envelope::to_envelope(&self.dir.borrow(), content);
+        let envelope = envelope.map(|mut env| {
+            if untrusted_identity {
+                envelope::set_untrusted(&mut env);
+            }
+            env
+        });
         if let Some(envelope) = envelope {
             if !self.emit(rpc::notification("receive", json!({"envelope": envelope, "account": self.account}))).await {
                 warn!("cannot forward received message to Corvus; leaving it unacknowledged");
