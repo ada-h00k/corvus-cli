@@ -44,6 +44,23 @@ use crate::textstyle;
 
 type Mgr = Manager<SqliteStore, Registered>;
 
+/// A download the background worker should do (F4): the pointer and, for stickers, the file
+/// name it is stored under.
+type DownloadJob = (AttachmentPointer, Option<String>);
+
+/// The bounds of automatic attachment downloading (F4), like the official clients: at most 32
+/// attachments per message, at most 100 MiB each (larger declared sizes are skipped), and at
+/// most 256 MiB per message. Every download has a timeout and the queue is bounded, so one
+/// stranger cannot stall the receive loop or fill the disk.
+const MAX_ATTACHMENTS_PER_MESSAGE: usize = 32;
+const MAX_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES_PER_MESSAGE: u64 = 256 * 1024 * 1024;
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+const DOWNLOAD_QUEUE_CAPACITY: usize = 128;
+/// Pointers of messages from hidden (unaccepted) senders, kept for downloadAttachment. Corvus
+/// accepts or dismisses the request; a dismissed one is superseded by newer messages.
+const PENDING_POINTER_CACHE: usize = 200;
+
 /// One stdout item. Incoming notifications carry a completion sender so the receive loop
 /// waits until Corvus has actually received the complete JSON line before sending a receipt.
 pub(crate) struct Output {
@@ -107,6 +124,13 @@ pub struct Daemon {
     /// Which stored attachment files belong to which message, so remote deletes can remove
     /// them (security review F1).
     attachment_index: RefCell<AttachmentIndex>,
+    /// Attachment downloads deferred out of the receive loop (F4): bounded queue, one download
+    /// at a time, a timeout each, and Corvus is notified when a file is ready.
+    download_tx: mpsc::Sender<DownloadJob>,
+    download_rx: RefCell<Option<mpsc::Receiver<DownloadJob>>>,
+    /// Pointers of messages from hidden (unaccepted) senders (F4): nothing is downloaded for
+    /// them automatically; Corvus calls downloadAttachment once the request is accepted.
+    pending_pointers: RefCell<VecDeque<(String, AttachmentPointer, Option<String>)>>,
 }
 
 pub(crate) enum Target {
@@ -135,6 +159,7 @@ impl Daemon {
         private_dir(&attachments)?;
         let attachment_index = AttachmentIndex::load(account_dir, crypto.as_ref());
         let (receipt_tx, receipt_rx) = mpsc::unbounded_channel();
+        let (download_tx, download_rx) = mpsc::channel(DOWNLOAD_QUEUE_CAPACITY);
         let daemon = Rc::new(Self {
             manager,
             out,
@@ -157,6 +182,9 @@ impl Daemon {
             decryption_reset_retry_at: Default::default(),
             pack_sync: Mutex::new(()),
             attachment_index: RefCell::new(attachment_index),
+            download_tx,
+            download_rx: RefCell::new(Some(download_rx)),
+            pending_pointers: Default::default(),
         });
         daemon.reload_directory().await;
         daemon.reload_groups().await;
@@ -174,6 +202,38 @@ impl Daemon {
         tokio::task::spawn_local(async move {
             daemon.receipt_worker(receiver).await;
         });
+    }
+
+    /// Starts the single attachment download worker on the local task set (F4).
+    pub(crate) fn start_download_worker(self: &Rc<Self>) {
+        let Some(receiver) = self.download_rx.borrow_mut().take() else { return };
+        let daemon = Rc::clone(self);
+        tokio::task::spawn_local(async move {
+            daemon.download_worker(receiver).await;
+        });
+    }
+
+    /// Downloads what the queue holds, one at a time, each with a timeout (F4). A file that is
+    /// ready is reported to Corvus, which may have shown the message before it existed; older
+    /// Corvus versions ignore the notification method and fetch lazily as before.
+    async fn download_worker(self: Rc<Self>, mut receiver: mpsc::Receiver<DownloadJob>) {
+        while let Some((pointer, name)) = receiver.recv().await {
+            let _ = tokio::time::timeout(DOWNLOAD_TIMEOUT, self.download(&pointer, name.clone())).await;
+            let id = name.or_else(|| envelope::attachment_id(&pointer));
+            if let Some(id) = id.filter(|id| self.attachments.join(id).exists()) {
+                let _ = self
+                    .emit(rpc::notification("attachmentDownloaded", json!({"id": id, "account": self.account})))
+                    .await;
+            }
+        }
+    }
+
+    /// Hands a download to the background worker. A full queue means a flood: the file is
+    /// skipped instead of piling up unbounded work (F4).
+    fn queue_download(&self, pointer: &AttachmentPointer, name: Option<String>) {
+        if self.download_tx.try_send((pointer.clone(), name)).is_err() {
+            debug!("attachment download queue is full; not downloading");
+        }
     }
 
     /// Collects nearby receipts, combines timestamps per recipient/type, and sends them serially.
@@ -863,13 +923,35 @@ impl Daemon {
             }
             _ => {}
         }
-        // Like signal-cli: attachments are downloaded before the message is announced.
-        for pointer in &pointers {
-            self.download(pointer, None).await;
-        }
+        // The message is announced before its attachments are downloaded (F4): a stranger
+        // cannot stall the receive loop with big files, and Corvus sees the message right
+        // away. The background worker (bounded queue, timeout each) notifies Corvus when a
+        // file is ready.
         let stickers = sticker_pointers(&content.body);
-        for (pointer, name) in &stickers {
-            self.download(pointer, Some(name.clone())).await;
+        // The ids the index keeps for remote deletes (F1): the names everything is stored under.
+        let mut ids: Vec<String> = pointers.iter().filter_map(envelope::attachment_id).collect();
+        ids.extend(stickers.iter().map(|(_, name)| name.clone()));
+        let pointers = filtered_for_download(&pointers);
+        let hidden = sender != self.self_aci && self.storage_state.borrow().hidden.contains(&sender);
+        if hidden {
+            // A message request is never downloaded automatically (F4): nothing is fetched
+            // until Corvus accepts it and calls downloadAttachment. The pointers are kept
+            // (bounded) so that call can still fetch them.
+            let mut pending = self.pending_pointers.borrow_mut();
+            for (pointer, name) in pointers.into_iter().map(|p| (p, None)).chain(stickers.into_iter().map(|(p, n)| (p, Some(n)))) {
+                let Some(id) = envelope::attachment_id(&pointer) else { continue };
+                while pending.len() >= PENDING_POINTER_CACHE {
+                    pending.pop_front();
+                }
+                pending.push_back((id, pointer, name));
+            }
+        } else {
+            for pointer in &pointers {
+                self.queue_download(pointer, None);
+            }
+            for (pointer, name) in &stickers {
+                self.queue_download(pointer, Some(name.clone()));
+            }
         }
         // A remote delete removes the message in Corvus; the files of its attachments must go
         // too (F1). The index below remembers which stored files belonged to which message.
@@ -891,8 +973,6 @@ impl Daemon {
         // delivers it again): presage's own copy of the message has served its purpose. Corvus
         // keeps the history, so the store must not become a second, never-pruned copy of every
         // message (F1) — only which files belong to which message is kept, for remote deletes.
-        let mut ids: Vec<String> = pointers.iter().filter_map(envelope::attachment_id).collect();
-        ids.extend(stickers.iter().map(|(_, name)| name.clone()));
         if let Some(timestamp) = message_timestamp(&content.body).filter(|_| !ids.is_empty()) {
             self.attachment_index.borrow_mut().remember(sender, timestamp, ids);
         }
@@ -1072,6 +1152,7 @@ impl Daemon {
             "sendReceipt" => self.send_receipt(p).await,
             "sendTyping" => self.send_typing(p).await,
             "getAttachment" => self.get_attachment(p).await,
+            "downloadAttachment" => self.download_attachment(p).await,
             "deleteAttachment" => self.delete_attachment(p).await,
             "getAvatar" => self.get_avatar(p).await,
             "updateContact" => self.update_contact(p).await,
@@ -1617,6 +1698,33 @@ impl Daemon {
         Ok(json!({"data": BASE64_STANDARD.encode(data)}))
     }
 
+    /// Downloads the attachment of a message from a hidden (unaccepted) sender on demand (F4):
+    /// nothing is fetched automatically for message requests. Corvus calls this once the
+    /// request is accepted, with the id from the envelope; the pointers of those messages are
+    /// kept (bounded) for exactly this. For any other id, the file must exist already.
+    async fn download_attachment(&self, p: &Params) -> RpcResult {
+        let id = p.required_str("id")?;
+        if !valid_attachment_id(id) {
+            return Err(RpcError::invalid("invalid attachment id"));
+        }
+        if !self.attachments.join(id).exists() {
+            let pointer = self
+                .pending_pointers
+                .borrow_mut()
+                .iter()
+                .find(|(pending, _, _)| pending == id)
+                .map(|(_, pointer, name)| (pointer.clone(), name.clone()));
+            let Some((pointer, name)) = pointer else {
+                return Err(RpcError::failed("Could not find attachment"));
+            };
+            match tokio::time::timeout(DOWNLOAD_TIMEOUT, self.download(&pointer, name)).await {
+                Ok(()) => {}
+                Err(_) => return Err(RpcError::failed("download timed out")),
+            }
+        }
+        self.get_attachment(p).await
+    }
+
     async fn get_avatar(&self, p: &Params) -> RpcResult {
         let mut m = self.manager.clone();
         let avatar = if let Some(id) = p.str("groupId") {
@@ -1731,6 +1839,30 @@ fn sticker_pointers(body: &ContentBody) -> Vec<(AttachmentPointer, String)> {
 fn collect_pointers(dm: &DataMessage, out: &mut Vec<AttachmentPointer>) {
     out.extend(dm.attachments.iter().cloned());
     out.extend(dm.preview.iter().filter_map(|p| p.image.clone()));
+}
+
+/// The pointers that are downloaded automatically (F4): Signal clients send at most 32
+/// attachments per message; anything that declares more than 100 MiB is skipped, and the
+/// per-message total is capped. Pointers without a usable id are skipped (they cannot be
+/// fetched later either). Stickers go through the same size limit but not the count cap:
+/// there is at most one per message.
+fn filtered_for_download(pointers: &[AttachmentPointer]) -> Vec<AttachmentPointer> {
+    let mut out = Vec::new();
+    let mut total = 0u64;
+    for pointer in pointers {
+        if out.len() >= MAX_ATTACHMENTS_PER_MESSAGE || total >= MAX_ATTACHMENT_BYTES_PER_MESSAGE {
+            break;
+        }
+        let Some(id) = envelope::attachment_id(pointer) else { continue };
+        let size = u64::try_from(pointer.size.unwrap_or(0)).unwrap_or(u64::MAX);
+        if size > MAX_ATTACHMENT_BYTES {
+            debug!(id, size, "skipping an attachment over the size limit");
+            continue;
+        }
+        total += size;
+        out.push(pointer.clone());
+    }
+    out
 }
 
 /// Only file-name-safe ids are stored under attachments/ and served by getAttachment.
@@ -2024,6 +2156,58 @@ mod attachment_index_tests {
         assert!(!valid_attachment_id("../secret"));
         assert!(!valid_attachment_id("a/b"));
         assert!(!valid_attachment_id("a.b"));
+    }
+}
+
+#[cfg(test)]
+mod download_caps_tests {
+    use super::*;
+    use presage::proto::attachment_pointer::AttachmentIdentifier;
+
+    fn pointer(key: &str, size: Option<u32>) -> AttachmentPointer {
+        AttachmentPointer {
+            attachment_identifier: Some(AttachmentIdentifier::CdnKey(key.into())),
+            content_type: Some("image/png".into()),
+            size,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn at_most_32_attachments_per_message() {
+        let pointers: Vec<_> = (0..100).map(|i| pointer(&format!("a{i}"), Some(1))).collect();
+        let filtered = filtered_for_download(&pointers);
+        assert_eq!(filtered.len(), MAX_ATTACHMENTS_PER_MESSAGE);
+        // The first ones in order: nothing is dropped arbitrarily.
+        assert_eq!(envelope::attachment_id(&filtered[0]).as_deref(), Some("a0"));
+        assert_eq!(envelope::attachment_id(&filtered[31]).as_deref(), Some("a31"));
+    }
+
+    #[test]
+    fn oversized_attachments_are_skipped() {
+        let pointers = vec![pointer("small", Some(1)), pointer("huge", Some(MAX_ATTACHMENT_BYTES as u32 + 1)), pointer("small2", Some(1))];
+        let filtered = filtered_for_download(&pointers);
+        let ids: Vec<_> = filtered.iter().filter_map(envelope::attachment_id).collect();
+        assert_eq!(ids, ["small", "small2"]);
+    }
+
+    #[test]
+    fn the_total_bytes_per_message_are_capped() {
+        // Each is under the single-file limit, together they exceed the message limit.
+        let pointers: Vec<_> = (0..MAX_ATTACHMENTS_PER_MESSAGE * 2)
+            .map(|i| pointer(&format!("b{i}"), Some((MAX_ATTACHMENT_BYTES_PER_MESSAGE / 16) as u32)))
+            .collect();
+        let filtered = filtered_for_download(&pointers);
+        assert!(filtered.len() < MAX_ATTACHMENTS_PER_MESSAGE);
+        assert!(filtered.len() >= 16);
+    }
+
+    #[test]
+    fn pointers_without_id_are_not_downloaded() {
+        let pointers = vec![AttachmentPointer::default(), pointer("ok", Some(1))];
+        let filtered = filtered_for_download(&pointers);
+        let ids: Vec<_> = filtered.iter().filter_map(envelope::attachment_id).collect();
+        assert_eq!(ids, ["ok"]);
     }
 }
 
