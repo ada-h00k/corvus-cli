@@ -677,6 +677,7 @@ dependencies = [
  "presage-store-sqlite",
  "rand 0.9.5",
  "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",

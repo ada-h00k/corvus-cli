@@ -1796,6 +1796,7 @@ fn group_member_or_pending(group: &Group, sender: Uuid, change: bool) -> bool {
 struct AttachmentIndex {
     /// "<sender uuid>:<message timestamp>" -> (added at, attachment/sticker file ids)
     entries: BTreeMap<String, (u64, Vec<String>)>,
+    /// The plaintext path; when a secret unlocked the data, the file lives at `<path>.enc`.
     path: PathBuf,
     crypto: Option<Crypto>,
 }
@@ -1807,10 +1808,11 @@ impl AttachmentIndex {
 
     fn load(account_dir: &Path, crypto: Option<&Crypto>) -> Self {
         let path = account_dir.join(Self::NAME);
+        let enc_path = path.with_extension("json.enc");
         let entries = match crypto {
-            Some(crypto) => match crypto.read_file(crypto::purpose::ATTACH, Self::NAME, &path) {
+            Some(crypto) => match crypto.read_file(crypto::purpose::ATTACH, Self::NAME, &enc_path) {
                 Ok(data) => parse_index(&data),
-                Err(e) if path.exists() => {
+                Err(e) if enc_path.exists() => {
                     warn!(%e, "cannot read the attachment index; remote deletes will not free their files");
                     Default::default()
                 }
@@ -1850,7 +1852,9 @@ impl AttachmentIndex {
         }
         let data = Value::Object(map).to_string();
         let written = match &self.crypto {
-            Some(crypto) => crypto.seal_file(crypto::purpose::ATTACH, Self::NAME, &self.path, data.as_bytes()),
+            Some(crypto) => {
+                crypto.seal_file(crypto::purpose::ATTACH, Self::NAME, &self.path.with_extension("json.enc"), data.as_bytes())
+            }
             // Plaintext mode: before any secret unlocked this data (see crypto.rs).
             None => crate::store::write_private_file(&self.path, data.as_bytes()).map_err(anyhow::Error::from),
         };

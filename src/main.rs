@@ -221,7 +221,8 @@ async fn link(accounts: &Accounts, device_name: String, crypto: Option<Crypto>) 
     // Keep a handle to the shared SQLite pool so it can be closed explicitly after
     // linking. Dropping the manager alone does not wait for SQLx connections to close;
     // on Windows this can leave store.db3/WAL files locked when the directory is renamed.
-    let store = open_store(&staging).await?;
+    // With a secret, the staging store is created as an SQLCipher database right away.
+    let store = open_store(&staging, crypto.as_ref()).await?;
     let (url_tx, url_rx) = oneshot::channel();
     let (linked, ()) = future::join(
         Manager::link_secondary_device(store.clone(), SignalServers::Production, device_name, url_tx),
@@ -254,25 +255,18 @@ async fn link(accounts: &Accounts, device_name: String, crypto: Option<Crypto>) 
     // Windows keeps SQLite database/WAL files locked until the pool has fully shut down.
     store.close().await;
     accounts.register(&staging, &number, &aci)?;
-    // The freshly linked store is plaintext while linking (SQLite needs a real file); encrypt
-    // it right away so the account directory holds no readable session keys afterwards.
-    if let Some(crypto) = &crypto {
-        if let Err(e) = store::seal_db(&accounts.account_dir(&aci), crypto) {
-            warn!(%e, "cannot encrypt the freshly linked store; the next start will");
-        }
-    }
+    // The store was created as an SQLCipher database when a secret unlocked the data (or stays
+    // plaintext while nothing is encrypted yet): it moves into place as it is.
     println!("Associated with: {number}");
     Ok(())
 }
 
 async fn json_rpc(accounts: &Accounts, account: &str, crypto: Option<Crypto>) -> anyhow::Result<()> {
     let dir = accounts.find(account)?;
-    // The encrypted store is decrypted to its usual path before presage opens it; a plaintext
-    // store.db3 (older version or crashed run) is used as it is and encrypted on shutdown.
-    if let Some(crypto) = &crypto {
-        store::prepare_db(&dir, crypto)?;
-    }
-    let store: SqliteStore = open_store(&dir).await?;
+    // With a secret, the store is an SQLCipher database keyed with a subkey of the master key:
+    // encrypted at rest from the first byte on, also during the run and after a crash (F2).
+    // The one-time migration of the old at-rest formats happens inside open_store.
+    let store: SqliteStore = open_store(&dir, crypto.as_ref()).await?;
     let manager: Manager<SqliteStore, Registered> = Manager::load_registered(store.clone())
         .await
         .context("account is not linked (link it again)")?;
@@ -341,17 +335,10 @@ async fn json_rpc(accounts: &Accounts, account: &str, crypto: Option<Crypto>) ->
     drop(daemon);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), writer).await;
     // Close the store so the write-ahead log is checkpointed and no file handle stays open
-    // (required before the plaintext database is removed; on Windows, open files cannot be
-    // unlinked). If the store does not close in time, the plaintext stays and the next start
-    // picks it up and encrypts it — no data is lost either way.
-    if tokio::time::timeout(std::time::Duration::from_secs(3), store.close()).await.is_ok() {
-        if let Some(crypto) = &crypto {
-            if let Err(e) = store::seal_db(&dir, crypto) {
-                warn!(%e, "cannot re-encrypt the store; the next start will");
-            }
-        }
-    } else {
-        warn!("the store did not close in time; leaving its plaintext for the next start to encrypt");
+    // (on Windows, open files cannot be unlinked). The store is an SQLCipher database already
+    // (or plaintext while nothing is encrypted yet): nothing is written on shutdown any more.
+    if tokio::time::timeout(std::time::Duration::from_secs(3), store.close()).await.is_err() {
+        warn!("the store did not close in time");
     }
     Ok(())
 }

@@ -76,6 +76,9 @@ const DOMAIN_ACCOUNTS: &[u8; 24] = b"corvus-cli/accounts.json";
 const DOMAIN_TRUST: &[u8; 24] = b"corvus-cli/trust.json\0\0\0";
 const DOMAIN_DB: &[u8; 24] = b"corvus-cli/store.db3\0\0\0\0";
 const DOMAIN_ATTACH: &[u8; 24] = b"corvus-cli/attachments\0\0";
+/// The SQLCipher key of the store (see store::open_store) is its own subkey, unrelated to the
+/// one that wraps a legacy frame copy of the store file.
+const DOMAIN_SQLCIPHER: &[u8; 24] = b"corvus-cli/sqlcipher key";
 
 /// Argon2id cost parameters; the same values the GUI's history file uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +102,14 @@ fn wipe(bytes: &mut [u8]) {
         unsafe { std::ptr::write_volatile(b, 0) };
     }
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Best-effort wipe of a String's contents (its buffer stays allocated, but zeroed), the same
+/// shape the `zeroize` crate uses. The invalid UTF-8 inside the buffer is never observed: the
+/// length is 0 by the time anyone can look again.
+pub fn wipe_str(s: &mut String) {
+    wipe(unsafe { s.as_mut_vec() }.as_mut_slice());
+    s.clear();
 }
 
 /// The master key, wiped when the last clone is gone.
@@ -166,6 +177,16 @@ impl Crypto {
         let mut cipher = chacha20::XChaCha20::new((&self.master.0).into(), domain.into());
         cipher.apply_keystream(&mut key);
         key
+    }
+
+    /// SQLCipher's raw-key string for the store: a dedicated subkey of the master key, in the
+    /// `x'<64 hex>'` form that makes SQLCipher use the key as it is instead of running PBKDF2
+    /// over a passphrase on every connection (see store::open_store).
+    pub fn sqlcipher_key(&self) -> String {
+        let mut key = self.subkey(DOMAIN_SQLCIPHER);
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        wipe(&mut key);
+        format!("x'{hex}'")
     }
 
     fn cipher(&self, domain: &[u8; 24]) -> (XChaCha20Poly1305, [u8; KEY_LEN]) {

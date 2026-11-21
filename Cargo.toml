@@ -26,6 +26,9 @@ futures = "0.3"
 mime_guess = "2.0"
 rand = "0.9"
 serde_json = "1.0"
+# The one-time SQLCipher migration of the store (sqlcipher_export); the same sqlx that
+# presage-store-sqlite uses (and whose SQLCipher build the store links against).
+sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio"] }
 tokio = { version = "1.48", features = ["rt", "io-std", "io-util", "sync", "time", "fs", "signal"] }
 tracing = "0.1"
 # No default features: "ansi" (stderr is read by corvus, not a terminal) and "tracing-log" are not needed.
