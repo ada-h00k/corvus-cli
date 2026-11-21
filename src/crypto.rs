@@ -112,6 +112,48 @@ pub fn wipe_str(s: &mut String) {
     s.clear();
 }
 
+/// Overwrites the value of `name` in the process's original environment block (L2). The
+/// strings the libc environ array points at are what /proc/<pid>/environ shows, and
+/// std::env::remove_var only edits std's own copy — anything running as the same user could
+/// read the secret from there for the life of the process. Zeroing the value bytes keeps the
+/// block's layout (and the "NAME=" prefix), so pointers into it stay valid; getenv callers
+/// see an empty value, consistent with the removed variable.
+///
+/// On Windows there is no readable original block shared the same way; the variable is only
+/// removed there. The longer-term answer is Corvus passing the secret over an inherited
+/// pipe, so it never enters the environment at all.
+pub fn scrub_environ(name: &str) {
+    #[cfg(unix)]
+    {
+        use std::ffi::c_char;
+        extern "C" {
+            static mut environ: *mut *mut c_char;
+        }
+        let prefix = format!("{name}=");
+        unsafe {
+            if environ.is_null() {
+                return;
+            }
+            let mut slot = environ;
+            while !(*slot).is_null() {
+                let entry = *slot;
+                let mut len = 0usize;
+                while *entry.add(len) != 0 {
+                    len += 1;
+                }
+                let bytes = std::slice::from_raw_parts(entry as *const u8, len);
+                if bytes.starts_with(prefix.as_bytes()) {
+                    let tail = std::slice::from_raw_parts_mut(entry.add(prefix.len()) as *mut u8, len - prefix.len());
+                    wipe(tail);
+                }
+                slot = slot.add(1);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = name;
+}
+
 /// The master key, wiped when the last clone is gone.
 struct MasterKey([u8; KEY_LEN]);
 
@@ -539,5 +581,32 @@ mod tests {
         let bytes = unsafe { std::slice::from_raw_parts(ptr, KEY_LEN) };
         assert!(bytes.iter().all(|&b| b == 0));
         std::mem::forget(key);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scrub_environ_zeroes_the_original_block() {
+        use std::ffi::CStr;
+        // The block the libc environ array points at is what /proc/<pid>/environ shows (L2):
+        // after the scrub, the value must be unreadable there, not just in std's copy.
+        std::env::set_var("CORVUS_CLI_SECRET_TEST", "hushhush");
+        scrub_environ("CORVUS_CLI_SECRET_TEST");
+        extern "C" {
+            static mut environ: *mut *mut std::ffi::c_char;
+        }
+        unsafe {
+            let mut slot = environ;
+            let mut found = false;
+            while !(*slot).is_null() {
+                let entry = CStr::from_ptr(*slot).to_bytes();
+                if entry.starts_with(b"CORVUS_CLI_SECRET_TEST=") {
+                    found = true;
+                    assert!(!entry.windows(8).any(|w| w == b"hushhush"));
+                }
+                slot = slot.add(1);
+            }
+            assert!(found);
+        }
+        std::env::remove_var("CORVUS_CLI_SECRET_TEST");
     }
 }

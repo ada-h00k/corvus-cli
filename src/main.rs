@@ -173,6 +173,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let mut previous = std::env::var(crypto::PREVIOUS_SECRET_ENV).ok().filter(|s| !s.is_empty());
     std::env::remove_var(crypto::SECRET_ENV);
     std::env::remove_var(crypto::PREVIOUS_SECRET_ENV);
+    // remove_var keeps the original environment block intact: /proc/<pid>/environ would show
+    // the secret for the life of the process (L2). The value bytes are zeroed in place, too.
+    crypto::scrub_environ(crypto::SECRET_ENV);
+    crypto::scrub_environ(crypto::PREVIOUS_SECRET_ENV);
     let crypto = match secret.as_deref() {
         Some(secret) => {
             let crypto = crypto::unlock(&dir, secret, previous.as_deref())?;
