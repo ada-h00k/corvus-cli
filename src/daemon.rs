@@ -2042,11 +2042,19 @@ fn parse_index(data: &[u8]) -> BTreeMap<String, (u64, Vec<String>)> {
 
 async fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("part");
-    tokio::fs::write(&tmp, data).await?;
+    // 0600 from the moment of creation (L7), like crypto::write_atomic's files; narrowing the
+    // permissions afterwards leaves a window a second could read.
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    {
+        use tokio::io::AsyncWriteExt as _;
+        let mut f = options.open(&tmp).await?;
+        f.write_all(data).await?;
     }
     tokio::fs::rename(tmp, path).await
 }

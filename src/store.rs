@@ -40,15 +40,42 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Creates a directory readable only by the user (key material lives below it).
+/// Creates a directory readable only by the user (key material lives below it). Missing
+/// components on the way are created 0700 as well (they would otherwise carry the umask's
+/// group/other bits). A directory that already exists is not chmod-ed — `-c ~` must not
+/// change the home directory (L7) — it is only required to already be 0700, with a clear
+/// error for the user otherwise.
 pub fn private_dir(path: &Path) -> anyhow::Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("cannot create {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        let mut walked = PathBuf::new();
+        for component in path.components() {
+            walked.push(component);
+            if !walked.is_dir() {
+                fs::create_dir(&walked).with_context(|| format!("cannot create {}", walked.display()))?;
+                fs::set_permissions(&walked, fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        let meta = fs::metadata(path)?;
+        if !meta.is_dir() {
+            bail!("{} is not a directory", path.display());
+        }
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            bail!(
+                "{} exists with permissions {:o}; corvus-cli needs 0700 there (key material lives below; create it or fix it yourself)",
+                path.display(),
+                mode
+            );
+        }
+        return Ok(());
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path).with_context(|| format!("cannot create {}", path.display()))?;
+        Ok(())
+    }
 }
 
 pub fn e164(number: &PhoneNumber) -> String {
@@ -107,7 +134,18 @@ impl Accounts {
             return Ok(());
         }
         let tmp = self.dir.join("accounts.json.tmp");
-        fs::write(&tmp, data).with_context(|| format!("cannot write account index {}", tmp.display()))?;
+        // 0600 from the moment of creation (L7), like crypto::write_atomic's files.
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(&tmp)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, &data))
+            .with_context(|| format!("cannot write account index {}", tmp.display()))?;
         let index_path = self.index_path();
         fs::rename(&tmp, &index_path)
             .with_context(|| format!("cannot replace account index {}", index_path.display()))?;
@@ -419,8 +457,41 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("corvus-cli-store-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        // 0700, like the dirs private_dir creates: the tests simulate real usage.
         fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         dir
+    }
+
+    #[test]
+    fn private_dir_creates_0700_and_refuses_looser_ones() {
+        let dir = tmp("private");
+        // Created on demand, readable only by the user — every level of the way.
+        let nested = dir.join("accounts").join("acc1");
+        private_dir(&nested).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&nested).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(fs::metadata(dir.join("accounts")).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        // An existing directory is not chmod-ed (`-c ~` must not change the home directory,
+        // L7): it is refused instead, and left as it was.
+        let existing = dir.join("loose");
+        fs::create_dir_all(&existing).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(private_dir(&existing).is_err());
+            assert_eq!(fs::metadata(&existing).unwrap().permissions().mode() & 0o777, 0o755);
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -477,7 +548,6 @@ mod tests {
     fn a_frame_encrypted_legacy_store_is_migrated_to_sqlcipher() {
         let dir = tmp("migrate-frame");
         let account = dir.join("accounts").join("acc1");
-        fs::create_dir_all(&account).unwrap();
         let crypto = crypto::unlock(&dir, "pw", None).unwrap();
         // The old at-rest format: a plaintext store, sealed as a frame (old seal_db).
         block_on(async {
@@ -504,7 +574,6 @@ mod tests {
     fn a_leftover_plaintext_store_is_migrated_to_sqlcipher() {
         let dir = tmp("migrate-plain");
         let account = dir.join("accounts").join("acc1");
-        fs::create_dir_all(&account).unwrap();
         let crypto = crypto::unlock(&dir, "pw", None).unwrap();
         // A crashed run left the plaintext store.db3 without a frame copy: it holds the
         // newest state and becomes the encrypted store.

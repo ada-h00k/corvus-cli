@@ -5,6 +5,7 @@
 // data (see crypto.rs), like everything else in the account directory.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::bail;
@@ -124,9 +125,19 @@ impl TrustStore {
             Some(crypto) => crypto.seal_file(crypto::purpose::TRUST, "", &enc_path_of(&self.path), data.as_bytes()),
             None => {
                 let tmp = self.path.with_extension("json.tmp");
-                std::fs::write(&tmp, &data)
-                    .and_then(|()| std::fs::rename(&tmp, &self.path))
-                    .map_err(anyhow::Error::from)
+                // 0600 from the moment of creation (L7), like crypto::write_atomic's files.
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create(true).truncate(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let written = options
+                    .open(&tmp)
+                    .and_then(|mut file| file.write_all(data.as_bytes()))
+                    .and_then(|()| std::fs::rename(&tmp, &self.path));
+                written.map_err(anyhow::Error::from)
             }
         };
         if let Err(e) = written {
