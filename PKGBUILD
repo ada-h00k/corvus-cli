@@ -16,7 +16,7 @@ options=('!debug')
 # The static files are pinned: makepkg verifies them against these sums.
 sha256sums=('SKIP'
             '8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef'
-            '5dd5140c8c9fbe440a3b099db2143b42439cea0f779ce5d3dd699f54bb6ee7b4')
+            '1ed717fba204f59107deaf1a6671e1e21b9f7d6c66fc33828fec8749865620b0')
 
 package() {
   install -Dm755 "${srcdir}/corvus-cli" "${pkgdir}/usr/bin/corvus-cli"
