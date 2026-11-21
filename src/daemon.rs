@@ -158,12 +158,15 @@ impl Daemon {
         let attachments = attachments_dir(account_dir);
         private_dir(&attachments)?;
         let attachment_index = AttachmentIndex::load(account_dir, crypto.as_ref());
+        // Fail closed (L1): a trust store that cannot be opened (replaced, corrupt, wrong
+        // secret) stops the run instead of accepting every key again as unverified.
+        let trust = TrustStore::load(account_dir, crypto.clone())?;
         let (receipt_tx, receipt_rx) = mpsc::unbounded_channel();
         let (download_tx, download_rx) = mpsc::channel(DOWNLOAD_QUEUE_CAPACITY);
         let daemon = Rc::new(Self {
             manager,
             out,
-            trust: RefCell::new(TrustStore::load(account_dir, crypto.clone())),
+            trust: RefCell::new(trust),
             group_extras: Default::default(),
             storage_state: Default::default(),
             attachments,
@@ -1689,13 +1692,29 @@ impl Daemon {
 
     async fn get_attachment(&self, p: &Params) -> RpcResult {
         let id = p.required_str("id")?;
-        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        if !valid_attachment_id(id) {
             return Err(RpcError::invalid("invalid attachment id"));
         }
-        let data = read_maybe_encrypted(&self.attachments.join(&id), &id, self.crypto.as_ref())
+        let data = self
+            .read_stored(id)
             .await
             .map_err(|_| RpcError::failed("Could not find attachment"))?;
         Ok(json!({"data": BASE64_STANDARD.encode(data)}))
+    }
+
+    /// Reads a file stored in the attachments dir. With a secret, stored files are frames (the
+    /// migration encrypted the leftovers at startup, new ones are written encrypted): a
+    /// plaintext file in their place is not served (L1). Files Corvus passes to `send` are
+    /// read leniently instead (read_maybe_encrypted) — they are not stored data.
+    pub(crate) async fn read_stored(&self, name: &str) -> anyhow::Result<Vec<u8>> {
+        let path = self.attachments.join(name);
+        match self.crypto.as_ref() {
+            Some(crypto) => {
+                let data = tokio::fs::read(&path).await?;
+                crypto.open(crypto::purpose::ATTACH, name, &data)
+            }
+            None => Ok(tokio::fs::read(&path).await?),
+        }
     }
 
     /// Downloads the attachment of a message from a hidden (unaccepted) sender on demand (F4):

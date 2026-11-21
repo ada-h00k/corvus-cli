@@ -78,13 +78,17 @@ impl Accounts {
     pub fn list(&self) -> BTreeMap<String, String> {
         // The encrypted index wins; the plaintext one is only read before the migration ran
         // (it is sealed at startup and never written again) and when no secret is available.
+        // A broken encrypted index is not silently replaced by an empty one from a plaintext
+        // file (L1): the error is reported and no account is found.
         if let Some(crypto) = &self.crypto {
             if self.index_enc_path().exists() {
-                return crypto
-                    .read_file(crypto::purpose::ACCOUNTS, "", &self.index_enc_path())
-                    .ok()
-                    .and_then(|data| serde_json::from_slice(&data).ok())
-                    .unwrap_or_default();
+                return match crypto.read_encrypted(crypto::purpose::ACCOUNTS, "", &self.index_enc_path()) {
+                    Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),
+                    Err(e) => {
+                        warn!(%e, "cannot open the account index; no account can be found");
+                        Default::default()
+                    }
+                };
             }
         }
         fs::read(self.index_path())
@@ -321,9 +325,11 @@ pub fn migrate_legacy(data_dir: &Path, crypto: &Crypto) -> anyhow::Result<()> {
         crypto.seal_file(crypto::purpose::ACCOUNTS, "", &data_dir.join("accounts.json.enc"), &data)?;
         wipe_and_remove(&index);
     }
-    // The account directory names come from the index, which is encrypted by now.
+    // The account directory names come from the index, which is encrypted by now. A broken
+    // index is not fatal here (migrate_legacy only encrypts leftover files), but the run
+    // afterwards cannot find accounts (see Accounts::list).
     let index_enc = data_dir.join("accounts.json.enc");
-    let Ok(data) = crypto.read_file(crypto::purpose::ACCOUNTS, "", &index_enc) else {
+    let Ok(data) = crypto.read_encrypted(crypto::purpose::ACCOUNTS, "", &index_enc) else {
         return Ok(());
     };
     let Ok(index) = serde_json::from_slice::<BTreeMap<String, String>>(&data) else {

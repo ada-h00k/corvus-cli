@@ -255,6 +255,17 @@ impl Crypto {
         }
     }
 
+    /// Reads `path` and decrypts it; the file must be a frame of `purpose`. Used for the .enc
+    /// files once the migration has run (L1): a plaintext file in their place is not accepted,
+    /// so a local attacker cannot swap encrypted data for data of their own.
+    pub fn read_encrypted(&self, purpose: u8, name: &str, path: &Path) -> anyhow::Result<Vec<u8>> {
+        let data = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+        if !Crypto::is_frame(&data) {
+            bail!("{} is not an encrypted corvus-cli file", path.display());
+        }
+        self.open(purpose, name, &data)
+    }
+
     /// Encrypts `plaintext` and writes it to `path` atomically, readable only by the user.
     pub fn seal_file(&self, purpose: u8, name: &str, path: &Path, plaintext: &[u8]) -> anyhow::Result<()> {
         let frame = self.seal(purpose, name, plaintext)?;

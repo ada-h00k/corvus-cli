@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use anyhow::bail;
 use base64::prelude::*;
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::protocol::{Fingerprint, IdentityKey};
@@ -68,16 +69,34 @@ fn enc_path_of(path: &Path) -> PathBuf {
 }
 
 impl TrustStore {
-    pub fn load(account_dir: &Path, crypto: Option<Crypto>) -> Self {
+    /// Loads the trust decisions. With a secret, the encrypted store is required: a plaintext
+    /// file in its place means someone replaced the data (the migration seals the plaintext at
+    /// startup), and accepting it would treat every key — including a changed one — as
+    /// verified again (L1). Load errors are fatal: the caller refuses to run without the trust
+    /// decisions instead of starting from a clean slate.
+    pub fn load(account_dir: &Path, crypto: Option<Crypto>) -> anyhow::Result<Self> {
         let path = account_dir.join("trust.json");
         let enc_path = account_dir.join("trust.json.enc");
-        let mut accepted = BTreeMap::new();
-        // The encrypted store wins; the plaintext one is only read before the migration ran.
-        let bytes = match (&crypto, enc_path.exists()) {
-            (Some(crypto), true) => crypto.read_file(crypto::purpose::TRUST, "", &enc_path).ok(),
-            _ => std::fs::read(&path).ok(),
+        let bytes = match &crypto {
+            Some(crypto) => {
+                if enc_path.exists() {
+                    Some(crypto.read_encrypted(crypto::purpose::TRUST, "", &enc_path)?)
+                } else if path.exists() {
+                    bail!(
+                        "{} is a plaintext trust store, but this data is encrypted; refusing to trust a replaced file",
+                        path.display()
+                    );
+                } else {
+                    None
+                }
+            }
+            None => std::fs::read(&path).ok(),
         };
-        if let Some(Value::Object(map)) = bytes.as_deref().and_then(|d| serde_json::from_slice(d).ok()) {
+        let mut accepted = BTreeMap::new();
+        if let Some(bytes) = bytes {
+            let Some(Value::Object(map)) = serde_json::from_slice(&bytes).ok() else {
+                bail!("{} cannot be parsed as a trust store", path.display());
+            };
             for (uuid, entry) in map {
                 let (Ok(uuid), Some(key), Some(level)) = (
                     Uuid::parse_str(&uuid),
@@ -89,7 +108,7 @@ impl TrustStore {
                 accepted.insert(uuid, Accepted { key, level, added: entry["added"].as_u64().unwrap_or(0) });
             }
         }
-        Self { path, crypto, accepted }
+        Ok(Self { path, crypto, accepted })
     }
 
     fn save(&self) {
@@ -184,7 +203,7 @@ mod tests {
     fn first_use_then_change_then_verify() {
         let dir = tmp();
         let alice = Uuid::from_u128(5);
-        let mut store = TrustStore::load(&dir, None);
+        let mut store = TrustStore::load(&dir, None).unwrap();
         assert_eq!(store.level(alice, b"k1", 10).0, Level::TrustedUnverified);
         assert_eq!(store.level(alice, b"k1", 20), (Level::TrustedUnverified, 10));
         assert_eq!(store.level(alice, b"k2", 30).0, Level::Untrusted);
@@ -192,7 +211,7 @@ mod tests {
         assert_eq!(store.level(alice, b"k2", 40).0, Level::Untrusted);
         store.accept(alice, b"k2", Level::TrustedVerified, 50);
         // Kept across restarts.
-        let mut again = TrustStore::load(&dir, None);
+        let mut again = TrustStore::load(&dir, None).unwrap();
         assert_eq!(again.level(alice, b"k2", 60), (Level::TrustedVerified, 50));
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -202,7 +221,7 @@ mod tests {
         let dir = tmp();
         let crypto = crypto::unlock(&dir, "pw", None).unwrap();
         let alice = Uuid::from_u128(7);
-        let mut store = TrustStore::load(&dir, Some(crypto));
+        let mut store = TrustStore::load(&dir, Some(crypto.clone())).unwrap();
         store.accept(alice, b"key-1", Level::TrustedVerified, 10);
         assert!(dir.join("trust.json.enc").exists());
         assert!(!dir.join("trust.json").exists());
@@ -210,8 +229,25 @@ mod tests {
         let raw = std::fs::read(dir.join("trust.json.enc")).unwrap();
         assert!(!raw.windows(5).any(|w| w == b"key-1"));
         // The next start (with the same secret) reads the decisions back.
-        let mut again = TrustStore::load(&dir, Some(crypto::unlock(&dir, "pw", None).unwrap()));
+        let mut again = TrustStore::load(&dir, Some(crypto::unlock(&dir, "pw", None).unwrap())).unwrap();
         assert_eq!(again.level(alice, b"key-1", 20), (Level::TrustedVerified, 10));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_replaced_or_broken_trust_store_is_refused() {
+        let dir = tmp();
+        let crypto = crypto::unlock(&dir, "pw", None).unwrap();
+        // No decisions yet: an empty store is fine.
+        assert!(TrustStore::load(&dir, Some(crypto.clone())).unwrap().accepted.is_empty());
+        // Someone replaced the encrypted store with plaintext data (L1): refused, not
+        // accepted as an empty (or attacker-chosen) trust state.
+        std::fs::write(dir.join("trust.json"), br#"{"key":"a2V5","level":"TRUSTED_UNVERIFIED"}"#).unwrap();
+        assert!(TrustStore::load(&dir, Some(crypto.clone())).is_err());
+        std::fs::remove_file(dir.join("trust.json")).unwrap();
+        // A broken encrypted file (truncated, wrong bytes) is fatal as well.
+        std::fs::write(dir.join("trust.json.enc"), b"not a frame").unwrap();
+        assert!(TrustStore::load(&dir, Some(crypto.clone())).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
