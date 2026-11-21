@@ -47,16 +47,6 @@ pub fn parse_pack_uri(uri: &str) -> Option<(Vec<u8>, Vec<u8>)> {
     Some((id?, key?))
 }
 
-/// File name under which the image of a received sticker is kept: keyed by the attachment
-/// pointer's id, not by the pack id and sticker id the sender claims (F5). Everything in a
-/// sticker message is sender-controlled; keyed by the pack, the first sender of a pack id
-/// would decide the image every later sticker of that pack shows. Keyed by the attachment,
-/// every message shows what its own sender sent — and the envelope reports the id, so Corvus
-/// fetches received sticker images with getAttachment.
-pub fn received_sticker_file(attachment_id: &str) -> String {
-    format!("sticker-{attachment_id}")
-}
-
 impl Daemon {
     /// Brings the local packs in line with the storage service: installs what the phone has
     /// installed there and drops what it uninstalled there. This is what makes the packs of the
@@ -286,10 +276,6 @@ mod tests {
         assert!(parse_pack_uri("https://signal.art/addstickers/#pack_id=0a1b").is_none());
         assert!(parse_pack_uri("https://example.org").is_none());
         assert!(parse_pack_uri("https://signal.art/addstickers/#pack_id=0g&pack_key=00").is_none());
-        // The received-sticker cache is keyed by the attachment id, not by the pack the sender
-        // claims (F5): two senders claiming the same pack keep their own images apart.
-        assert_eq!(received_sticker_file("ab_c-d9"), "sticker-ab_c-d9");
-        assert_ne!(received_sticker_file("ab_c-d9"), received_sticker_file("zz_z-z9"));
     }
 
     /// A manifest as the sticker CDN serves it, decrypted and decoded the way download_pack does.

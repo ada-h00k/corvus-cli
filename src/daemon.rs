@@ -195,6 +195,7 @@ impl Daemon {
         // store's copy goes now (F1), and with it the attachments no one cleaned up.
         daemon.purge_messages().await;
         daemon.sweep_old_attachments().await;
+        rename_legacy_sticker_files(&daemon.attachments).await;
         Ok(daemon)
     }
 
@@ -1847,7 +1848,10 @@ fn signal_retry_after(message: &str) -> Option<Duration> {
 }
 
 /// The image of a received sticker, kept so getAttachment serves it for packs that are not
-/// installed. The file name comes from the attachment id, not from the sender-chosen pack (F5).
+/// installed. It is stored under the attachment pointer's id — the same name the envelope
+/// reports as attachmentId and getAttachment serves — never under the pack id and sticker
+/// id the sender claims (F5): keyed by the pack, the first sender of a pack id would decide
+/// the image every later sticker of that pack shows.
 fn sticker_pointers(body: &ContentBody) -> Vec<(AttachmentPointer, String)> {
     let dm = match body {
         ContentBody::DataMessage(dm) => Some(dm),
@@ -1861,10 +1865,29 @@ fn sticker_pointers(body: &ContentBody) -> Vec<(AttachmentPointer, String)> {
         .and_then(|s| {
             let pointer = s.data.clone()?;
             let id = envelope::attachment_id(&pointer)?;
-            Some((pointer, crate::stickers::received_sticker_file(&id)))
+            Some((pointer, id))
         })
         .into_iter()
         .collect()
+}
+
+/// Renames the sticker files the first F5 fix wrote as "sticker-<id>": getAttachment serves
+/// "<id>", so received stickers of packs that are not installed could not be fetched at all
+/// (the follow-up fix stores the plain id). One-time at startup; cheap when nothing matches.
+async fn rename_legacy_sticker_files(dir: &Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else { return };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix("sticker-")) else {
+            continue;
+        };
+        if !valid_attachment_id(rest) || dir.join(rest).exists() {
+            continue;
+        }
+        if let Err(e) = tokio::fs::rename(entry.path(), dir.join(rest)).await {
+            debug!(%e, id = rest, "cannot rename a legacy sticker file");
+        }
+    }
 }
 
 fn collect_pointers(dm: &DataMessage, out: &mut Vec<AttachmentPointer>) {
@@ -2318,5 +2341,63 @@ mod group_membership_tests {
         assert!(!group_change_present(Some(&empty)));
         assert!(group_change_present(Some(&announced)));
         assert!(!group_change_present(None));
+    }
+}
+
+#[cfg(test)]
+mod received_sticker_tests {
+    use super::*;
+    use presage::proto::attachment_pointer::AttachmentIdentifier;
+    use presage::proto::data_message::Sticker;
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("corvus-cli-sticker-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sticker_body(attachment_key: &str) -> ContentBody {
+        ContentBody::DataMessage(DataMessage {
+            sticker: Some(Sticker {
+                pack_id: Some(vec![0x0a, 0x1b]),
+                sticker_id: Some(3),
+                data: Some(AttachmentPointer {
+                    attachment_identifier: Some(AttachmentIdentifier::CdnKey(attachment_key.into())),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn received_stickers_are_stored_under_the_attachment_id() {
+        // getAttachment serves "<id>" and the envelope reports the same id as attachmentId:
+        // the file name must be exactly that id (F5), not a variant getAttachment never finds.
+        let pointers = sticker_pointers(&sticker_body("ab_c-d9"));
+        assert_eq!(pointers.len(), 1);
+        assert_eq!(pointers[0].1, "ab_c-d9");
+        assert_eq!(envelope::attachment_id(&pointers[0].0).as_deref(), Some("ab_c-d9"));
+    }
+
+    #[test]
+    fn legacy_sticker_files_are_renamed_to_the_attachment_id() {
+        let dir = tmp("sticker-rename");
+        std::fs::write(dir.join("sticker-ab_c-d9"), b"old").unwrap();
+        // A name that is not a valid attachment id is never renamed (and never served).
+        std::fs::write(dir.join("sticker-planted*"), b"evil").unwrap();
+        // An existing file with the target name is kept, not overwritten.
+        std::fs::write(dir.join("ee11-22"), b"target").unwrap();
+        std::fs::write(dir.join("sticker-ee11-22"), b"legacy").unwrap();
+        std::fs::write(dir.join("keep.webp"), b"plain").unwrap();
+        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(rename_legacy_sticker_files(&dir));
+        assert!(!dir.join("sticker-ab_c-d9").exists());
+        assert_eq!(std::fs::read(dir.join("ab_c-d9")).unwrap(), b"old");
+        assert!(dir.join("sticker-planted*").exists());
+        assert_eq!(std::fs::read(dir.join("ee11-22")).unwrap(), b"target");
+        assert!(dir.join("sticker-ee11-22").exists());
+        assert!(dir.join("keep.webp").exists());
     }
 }
