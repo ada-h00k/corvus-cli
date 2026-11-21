@@ -1,8 +1,10 @@
 // On-disk layout: <data dir>/accounts/<aci>/{store.db3,attachments/} plus accounts.json
 // (number -> aci). When a secret is available (see crypto.rs), the index is accounts.json.enc,
-// the store is store.db3.enc and trust decisions live in trust.json.enc; the SQLite store is
-// decrypted to its plaintext path for the run and re-encrypted on shutdown. The data dir is
-// $CORVUS_CLI_DIR, else $XDG_DATA_HOME/corvus-cli, else ~/.local/share/corvus-cli.
+// trust decisions live in trust.json.enc, and the SQLite store IS an SQLCipher database keyed
+// with a subkey of the master key — encrypted at rest from the first byte on, with no
+// plaintext copy at any time (see open_store). Without a secret nothing is encrypted yet: the
+// files are plaintext and stay that way. The data dir is $CORVUS_CLI_DIR, else
+// $XDG_DATA_HOME/corvus-cli, else ~/.local/share/corvus-cli.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -11,7 +13,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context as _};
 use presage::libsignal_service::prelude::phonenumber::{self, PhoneNumber};
 use presage::model::identity::OnNewIdentity;
-use presage_store_sqlite::SqliteStore;
+use presage_store_sqlite::{SqliteConnectOptions, SqliteStore};
+use sqlx::{query, sqlite::SqlitePoolOptions};
 use tracing::warn;
 
 use crate::crypto::{self, Crypto};
@@ -37,15 +40,42 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Creates a directory readable only by the user (key material lives below it).
+/// Creates a directory readable only by the user (key material lives below it). Missing
+/// components on the way are created 0700 as well (they would otherwise carry the umask's
+/// group/other bits). A directory that already exists is not chmod-ed — `-c ~` must not
+/// change the home directory (L7) — it is only required to already be 0700, with a clear
+/// error for the user otherwise.
 pub fn private_dir(path: &Path) -> anyhow::Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("cannot create {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        let mut walked = PathBuf::new();
+        for component in path.components() {
+            walked.push(component);
+            if !walked.is_dir() {
+                fs::create_dir(&walked).with_context(|| format!("cannot create {}", walked.display()))?;
+                fs::set_permissions(&walked, fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        let meta = fs::metadata(path)?;
+        if !meta.is_dir() {
+            bail!("{} is not a directory", path.display());
+        }
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            bail!(
+                "{} exists with permissions {:o}; corvus-cli needs 0700 there (key material lives below; create it or fix it yourself)",
+                path.display(),
+                mode
+            );
+        }
+        return Ok(());
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path).with_context(|| format!("cannot create {}", path.display()))?;
+        Ok(())
+    }
 }
 
 pub fn e164(number: &PhoneNumber) -> String {
@@ -75,13 +105,17 @@ impl Accounts {
     pub fn list(&self) -> BTreeMap<String, String> {
         // The encrypted index wins; the plaintext one is only read before the migration ran
         // (it is sealed at startup and never written again) and when no secret is available.
+        // A broken encrypted index is not silently replaced by an empty one from a plaintext
+        // file (L1): the error is reported and no account is found.
         if let Some(crypto) = &self.crypto {
             if self.index_enc_path().exists() {
-                return crypto
-                    .read_file(crypto::purpose::ACCOUNTS, "", &self.index_enc_path())
-                    .ok()
-                    .and_then(|data| serde_json::from_slice(&data).ok())
-                    .unwrap_or_default();
+                return match crypto.read_encrypted(crypto::purpose::ACCOUNTS, "", &self.index_enc_path()) {
+                    Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),
+                    Err(e) => {
+                        warn!(%e, "cannot open the account index; no account can be found");
+                        Default::default()
+                    }
+                };
             }
         }
         fs::read(self.index_path())
@@ -100,7 +134,18 @@ impl Accounts {
             return Ok(());
         }
         let tmp = self.dir.join("accounts.json.tmp");
-        fs::write(&tmp, data).with_context(|| format!("cannot write account index {}", tmp.display()))?;
+        // 0600 from the moment of creation (L7), like crypto::write_atomic's files.
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(&tmp)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, &data))
+            .with_context(|| format!("cannot write account index {}", tmp.display()))?;
         let index_path = self.index_path();
         fs::rename(&tmp, &index_path)
             .with_context(|| format!("cannot replace account index {}", index_path.display()))?;
@@ -162,13 +207,145 @@ impl Accounts {
     }
 }
 
-pub async fn open_store(account_dir: &Path) -> anyhow::Result<SqliteStore> {
+pub async fn open_store(account_dir: &Path, crypto: Option<&Crypto>) -> anyhow::Result<SqliteStore> {
     private_dir(account_dir)?;
     let url = format!("sqlite://{}", account_dir.join("store.db3").display());
-    // Like signal-cli's default (trust on first use): new identities are accepted and marked unverified.
-    SqliteStore::open(&url, OnNewIdentity::Trust)
+    match crypto {
+        None => {
+            // No secret unlocked the data: nothing is encrypted yet, the store is plaintext.
+            // An encrypted store cannot be opened here (see the SQLCipher error below).
+            SqliteStore::open(&url, OnNewIdentity::Trust)
+                .await
+                .with_context(|| format!("cannot open store in {}", account_dir.display()))
+        }
+        Some(crypto) => {
+            migrate_store(account_dir, crypto).await?;
+            // SQLCipher with a raw key: no second key derivation runs on any connection.
+            let mut key = cipher_key(crypto);
+            let options = cipher_options(&url, &key)?;
+            let store = SqliteStore::open_with_options(options, OnNewIdentity::Trust)
+                .await
+                .with_context(|| format!("cannot open store in {}", account_dir.display()));
+            crypto::wipe_str(&mut key);
+            store
+        }
+    }
+}
+
+/// SQLite's magic header: a plaintext database starts with it, an SQLCipher database does not.
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+/// True when `path` holds a plaintext SQLite database.
+fn is_plaintext_db(path: &Path) -> bool {
+    use std::io::Read as _;
+    let mut header = [0u8; SQLITE_HEADER.len()];
+    let Ok(mut file) = fs::File::open(path) else { return false };
+    file.read_exact(&mut header).is_ok() && header == *SQLITE_HEADER
+}
+
+/// SQLCipher's raw-key string of the store key, quoted for direct use in `PRAGMA key` and the
+/// ATTACH KEY clause: `'x''<64 hex>'''` makes SQLite hand SQLCipher the string `x'<64 hex>'`,
+/// which it recognises as a raw key and uses without a key derivation.
+fn cipher_key(crypto: &Crypto) -> String {
+    format!("'{}'", crypto.sqlcipher_key().replace('\'', "''"))
+}
+
+/// SQLCipher connect options of the store: the raw key (see cipher_key) and `secure_delete`,
+/// which zeroes freed pages so a deleted message does not linger inside the file (F1 clears
+/// and deletes).
+fn cipher_options(url: &str, key: &str) -> anyhow::Result<SqliteConnectOptions> {
+    let options: SqliteConnectOptions = url
+        .parse()
+        .with_context(|| format!("cannot use the store url {url}"))?;
+    Ok(options.create_if_missing(true).foreign_keys(true).pragma("key", key.to_string()).pragma("secure_delete", "ON"))
+}
+
+/// One-time move from the old at-rest formats into the SQLCipher store (F2). Two legacy states
+/// existed: a plaintext store.db3 (written by an older version, or left by a crashed run that
+/// never re-encrypted) and its frame-encrypted copy store.db3.enc (see the old prepare_db and
+/// seal_db). The plaintext always held the newest state; it is exported into an encrypted
+/// database with sqlcipher_export and wiped afterwards. From then on store.db3 IS the
+/// encrypted database: no plaintext copy ever exists on disk, not even while running.
+async fn migrate_store(account_dir: &Path, crypto: &Crypto) -> anyhow::Result<()> {
+    let db = account_dir.join("store.db3");
+    let enc = account_dir.join("store.db3.enc");
+    if !db.exists() && !enc.exists() {
+        return Ok(()); // a fresh account
+    }
+    if db.exists() && !is_plaintext_db(&db) {
+        // Already migrated. A stale .enc (the old code re-encrypted on every clean shutdown)
+        // is redundant now.
+        if enc.exists() {
+            warn!("the store is already an SQLCipher database; removing the redundant store.db3.enc");
+            wipe_and_remove(&enc);
+        }
+        return Ok(());
+    }
+    // Bring the newest state into the plaintext file: decrypt the frame copy when the
+    // plaintext is gone.
+    if !db.exists() {
+        let data = crypto
+            .read_file(crypto::purpose::DB, "", &enc)
+            .with_context(|| format!("cannot decrypt {}", enc.display()))?;
+        if !data.starts_with(SQLITE_HEADER) {
+            anyhow::bail!("{} does not hold a SQLite database", enc.display());
+        }
+        write_private_file(&db, &data)?;
+        wipe_and_remove(&enc);
+    }
+    encrypt_store(account_dir, crypto).await
+}
+
+/// Exports the plaintext store at store.db3 into an SQLCipher database and replaces the
+/// plaintext with it. The plaintext is only wiped after the export succeeded and its file was
+/// closed, so an interrupted migration leaves the old state untouched for the next start to
+/// retry. An uncheckpointed write-ahead log is fine: SQLite replays it when the source opens.
+async fn encrypt_store(account_dir: &Path, crypto: &Crypto) -> anyhow::Result<()> {
+    let db = account_dir.join("store.db3");
+    let target = account_dir.join("store.db3.sqlcipher");
+    let _ = fs::remove_file(&target);
+
+    // The migration runs on its own pool, before presage opens the store; foreign keys are
+    // off while the export copies the tables. Two forms of the same key: SQLCipher's raw-key
+    // string for the bound KEY parameter, and the SQL-quoted form for the PRAGMA key of the
+    // connections presage opens later — they must agree, or the store could not be opened again.
+    let mut key = crypto.sqlcipher_key();
+    let mut pragma_key = cipher_key(crypto);
+    let source_url = format!("sqlite://{}", db.display());
+    let source: SqliteConnectOptions = source_url
+        .parse()
+        .with_context(|| format!("cannot read {}", db.display()))?;
+    // create_if_missing: the attached TARGET is created by the ATTACH (which opens with the
+    // connection's flags); the source is verified to exist by migrate_store.
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(source.create_if_missing(true).foreign_keys(false))
         .await
-        .with_context(|| format!("cannot open store in {}", account_dir.display()))
+        .with_context(|| format!("cannot read {}", db.display()))?;
+    let attach_path = target.display().to_string();
+    let exported: anyhow::Result<()> = async {
+        query("ATTACH DATABASE ? AS migrate KEY ?")
+            .bind(attach_path)
+            .bind(key.clone())
+            .execute(&pool)
+            .await?;
+        query("SELECT sqlcipher_export('migrate')").execute(&pool).await?;
+        query("DETACH DATABASE migrate").execute(&pool).await?;
+        Ok(())
+    }
+    .await;
+    pool.close().await;
+    crypto::wipe_str(&mut key);
+    crypto::wipe_str(&mut pragma_key);
+    exported?;
+    // The encrypted copy exists and is closed; the plaintext (and any journal leftovers) can go.
+    wipe_and_remove(&db);
+    for leftover in ["store.db3-wal", "store.db3-shm", "store.db3-journal"] {
+        wipe_and_remove(&account_dir.join(leftover));
+    }
+    fs::rename(&target, &db)
+        .with_context(|| format!("cannot put the encrypted store in place at {}", db.display()))?;
+    Ok(())
 }
 
 pub fn attachments_dir(account_dir: &Path) -> PathBuf {
@@ -176,48 +353,6 @@ pub fn attachments_dir(account_dir: &Path) -> PathBuf {
 }
 
 // ---- encrypted data at rest -----------------------------------------------------------------
-
-/// Decrypts the SQLite store of `account_dir` so presage can open it at its usual path. A
-/// plaintext store.db3 (left behind by a crashed run, or written by an older version) wins: it
-/// holds the newest state, and seal_db re-encrypts it on the next clean shutdown.
-pub fn prepare_db(account_dir: &Path, crypto: &Crypto) -> anyhow::Result<()> {
-    let db = account_dir.join("store.db3");
-    if db.exists() {
-        return Ok(());
-    }
-    let enc = account_dir.join("store.db3.enc");
-    if !enc.exists() {
-        return Ok(());
-    }
-    let data = crypto.read_file(crypto::purpose::DB, "", &enc)?;
-    private_dir(account_dir)?;
-    write_private_file(&db, &data)?;
-    Ok(())
-}
-
-/// Re-encrypts the SQLite store after the process closed it and removes the plaintext, so the
-/// account directory holds no readable session keys while corvus-cli is not running. Callers
-/// only seal after the store was closed successfully; a leftover write-ahead log means the
-/// newest state is not in the main file yet, and then nothing is sealed (the next start picks
-/// the plaintext up instead of losing it).
-pub fn seal_db(account_dir: &Path, crypto: &Crypto) -> anyhow::Result<()> {
-    let db = account_dir.join("store.db3");
-    if !db.exists() {
-        return Ok(());
-    }
-    let wal = account_dir.join("store.db3-wal");
-    if wal.is_file() && fs::metadata(&wal)?.len() > 0 {
-        bail!("the store still has an uncheckpointed write-ahead log; leaving it for the next start");
-    }
-    let data = fs::read(&db).with_context(|| format!("cannot read {}", db.display()))?;
-    crypto.seal_file(crypto::purpose::DB, "", &account_dir.join("store.db3.enc"), &data)?;
-    // The encrypted copy exists now; the plaintext (and any journal leftovers) can go.
-    wipe_and_remove(&db);
-    for leftover in ["store.db3-wal", "store.db3-shm", "store.db3-journal"] {
-        wipe_and_remove(&account_dir.join(leftover));
-    }
-    Ok(())
-}
 
 /// One-time encryption of the files an older, plaintext version left behind. Runs after the
 /// keyring is unlocked, before any command. Cheap when there is nothing to do.
@@ -228,9 +363,11 @@ pub fn migrate_legacy(data_dir: &Path, crypto: &Crypto) -> anyhow::Result<()> {
         crypto.seal_file(crypto::purpose::ACCOUNTS, "", &data_dir.join("accounts.json.enc"), &data)?;
         wipe_and_remove(&index);
     }
-    // The account directory names come from the index, which is encrypted by now.
+    // The account directory names come from the index, which is encrypted by now. A broken
+    // index is not fatal here (migrate_legacy only encrypts leftover files), but the run
+    // afterwards cannot find accounts (see Accounts::list).
     let index_enc = data_dir.join("accounts.json.enc");
-    let Ok(data) = crypto.read_file(crypto::purpose::ACCOUNTS, "", &index_enc) else {
+    let Ok(data) = crypto.read_encrypted(crypto::purpose::ACCOUNTS, "", &index_enc) else {
         return Ok(());
     };
     let Ok(index) = serde_json::from_slice::<BTreeMap<String, String>>(&data) else {
@@ -296,7 +433,7 @@ fn wipe_and_remove(path: &Path) {
 }
 
 /// Writes a file readable only by the user, through a temp file + rename.
-fn write_private_file(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_private_file(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     let tmp = path.with_extension("part");
     {
         let mut o = fs::OpenOptions::new();
@@ -320,8 +457,41 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("corvus-cli-store-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        // 0700, like the dirs private_dir creates: the tests simulate real usage.
         fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         dir
+    }
+
+    #[test]
+    fn private_dir_creates_0700_and_refuses_looser_ones() {
+        let dir = tmp("private");
+        // Created on demand, readable only by the user — every level of the way.
+        let nested = dir.join("accounts").join("acc1");
+        private_dir(&nested).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&nested).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(fs::metadata(dir.join("accounts")).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        // An existing directory is not chmod-ed (`-c ~` must not change the home directory,
+        // L7): it is refused instead, and left as it was.
+        let existing = dir.join("loose");
+        fs::create_dir_all(&existing).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(private_dir(&existing).is_err());
+            assert_eq!(fs::metadata(&existing).unwrap().permissions().mode() & 0o777, 0o755);
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -348,41 +518,75 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The tests run on their own current-thread runtime (tokio's test macros are not enabled).
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(future)
+    }
+
     #[test]
-    fn db_roundtrip_and_plaintext_wins() {
-        let dir = tmp("db");
+    fn the_store_is_an_sqlcipher_database_with_a_secret() {
+        let dir = tmp("sqlcipher");
         let account = dir.join("accounts").join("acc1");
-        fs::create_dir_all(&account).unwrap();
         let crypto = crypto::unlock(&dir, "pw", None).unwrap();
-        // Legacy plaintext database: prepare keeps it, seal encrypts and removes it.
-        fs::write(account.join("store.db3"), b"sqlite bytes").unwrap();
-        prepare_db(&account, &crypto).unwrap();
-        assert_eq!(fs::read(account.join("store.db3")).unwrap(), b"sqlite bytes");
-        seal_db(&account, &crypto).unwrap();
-        assert!(!account.join("store.db3").exists());
-        let raw = fs::read(account.join("store.db3.enc")).unwrap();
-        assert!(!raw.windows(6).any(|w| w == b"sqlite"));
-        // Encrypted database: prepare restores it, with user-only permissions.
-        prepare_db(&account, &crypto).unwrap();
-        assert_eq!(fs::read(account.join("store.db3")).unwrap(), b"sqlite bytes");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(account.join("store.db3")).unwrap().permissions().mode() & 0o777, 0o600);
-        }
+        block_on(async {
+            let store = open_store(&account, Some(&crypto)).await.unwrap();
+            store.close().await;
+        });
+        // The store file is not a plaintext SQLite database (F2).
+        let raw = fs::read(account.join("store.db3")).unwrap();
+        assert!(&raw[..16] != SQLITE_HEADER);
+        // Opening it again with the key works; without one it must not open.
+        block_on(async {
+            open_store(&account, Some(&crypto)).await.unwrap().close().await;
+            assert!(open_store(&account, None).await.is_err());
+        });
+        // And the index keeps working next to it (plaintext mode stays for unencrypted data).
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn dirty_wal_blocks_sealing() {
-        let dir = tmp("wal");
+    fn a_frame_encrypted_legacy_store_is_migrated_to_sqlcipher() {
+        let dir = tmp("migrate-frame");
         let account = dir.join("accounts").join("acc1");
-        fs::create_dir_all(&account).unwrap();
         let crypto = crypto::unlock(&dir, "pw", None).unwrap();
-        fs::write(account.join("store.db3"), b"sqlite bytes").unwrap();
-        fs::write(account.join("store.db3-wal"), b"uncheckpointed frames").unwrap();
-        assert!(seal_db(&account, &crypto).is_err());
-        assert_eq!(fs::read(account.join("store.db3")).unwrap(), b"sqlite bytes");
+        // The old at-rest format: a plaintext store, sealed as a frame (old seal_db).
+        block_on(async {
+            open_store(&account, None).await.unwrap().close().await;
+        });
+        let data = fs::read(account.join("store.db3")).unwrap();
+        assert!(data.starts_with(SQLITE_HEADER));
+        crypto.seal_file(crypto::purpose::DB, "", &account.join("store.db3.enc"), &data).unwrap();
+        fs::remove_file(account.join("store.db3")).unwrap();
+
+        block_on(async {
+            open_store(&account, Some(&crypto)).await.unwrap().close().await;
+        });
+        // The frame copy is gone, the store file is SQLCipher, no plaintext or export
+        // leftovers remain.
+        assert!(!account.join("store.db3.enc").exists());
+        assert!(!account.join("store.db3.sqlcipher").exists());
+        let raw = fs::read(account.join("store.db3")).unwrap();
+        assert!(&raw[..16] != SQLITE_HEADER);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_leftover_plaintext_store_is_migrated_to_sqlcipher() {
+        let dir = tmp("migrate-plain");
+        let account = dir.join("accounts").join("acc1");
+        let crypto = crypto::unlock(&dir, "pw", None).unwrap();
+        // A crashed run left the plaintext store.db3 without a frame copy: it holds the
+        // newest state and becomes the encrypted store.
+        block_on(async {
+            open_store(&account, None).await.unwrap().close().await;
+        });
+        assert!(fs::read(account.join("store.db3")).unwrap().starts_with(SQLITE_HEADER));
+        block_on(async {
+            open_store(&account, Some(&crypto)).await.unwrap().close().await;
+        });
+        assert!(!account.join("store.db3.enc").exists());
+        let raw = fs::read(account.join("store.db3")).unwrap();
+        assert!(&raw[..16] != SQLITE_HEADER);
         fs::remove_dir_all(dir).unwrap();
     }
 }

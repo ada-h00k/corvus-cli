@@ -237,6 +237,10 @@ fn data_message_fields(dir: &Directory, dm: &DataMessage, out: &mut Map<String, 
                 "packId": sticker.pack_id.as_deref().map(hex),
                 "stickerId": sticker.sticker_id,
                 "emoji": sticker.emoji,
+                // The id the image of this sticker is stored under (F5): Corvus fetches received
+                // sticker images with getAttachment, so a sender cannot choose another chat's
+                // sticker image by claiming a popular pack.
+                "attachmentId": sticker.data.as_ref().and_then(attachment_id),
             }),
         );
     }
@@ -315,6 +319,15 @@ fn header(dir: &Directory, meta: &Metadata) -> Map<String, Value> {
     env.insert("timestamp".into(), json!(meta.client_timestamp.timestamp_millis()));
     env.insert("serverReceivedTimestamp".into(), json!(meta.server_timestamp.timestamp_millis()));
     env
+}
+
+/// Marks an envelope as coming from an identity the user has not accepted (a changed safety
+/// number, L6): sends to it are blocked, and with the mark Corvus can warn about the incoming
+/// side too, when the message arrives.
+pub fn set_untrusted(envelope: &mut Value) {
+    if let Value::Object(env) = envelope {
+        env.insert("untrustedIdentity".into(), json!(true));
+    }
 }
 
 /// The envelope for one received message, or None for content corvus has no use for

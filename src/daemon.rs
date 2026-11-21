@@ -2,7 +2,7 @@
 // methods corvus calls. Everything runs on one thread (presage's store futures are !Send).
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -43,6 +43,23 @@ use crate::store::{attachments_dir, e164, private_dir};
 use crate::textstyle;
 
 type Mgr = Manager<SqliteStore, Registered>;
+
+/// A download the background worker should do (F4): the pointer and, for stickers, the file
+/// name it is stored under.
+type DownloadJob = (AttachmentPointer, Option<String>);
+
+/// The bounds of automatic attachment downloading (F4), like the official clients: at most 32
+/// attachments per message, at most 100 MiB each (larger declared sizes are skipped), and at
+/// most 256 MiB per message. Every download has a timeout and the queue is bounded, so one
+/// stranger cannot stall the receive loop or fill the disk.
+const MAX_ATTACHMENTS_PER_MESSAGE: usize = 32;
+const MAX_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES_PER_MESSAGE: u64 = 256 * 1024 * 1024;
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+const DOWNLOAD_QUEUE_CAPACITY: usize = 128;
+/// Pointers of messages from hidden (unaccepted) senders, kept for downloadAttachment. Corvus
+/// accepts or dismisses the request; a dismissed one is superseded by newer messages.
+const PENDING_POINTER_CACHE: usize = 200;
 
 /// One stdout item. Incoming notifications carry a completion sender so the receive loop
 /// waits until Corvus has actually received the complete JSON line before sending a receipt.
@@ -104,6 +121,16 @@ pub struct Daemon {
     /// Sticker pack downloads are serialised: every storage change triggers a sync, and two of
     /// them would download the same packs twice.
     pub(crate) pack_sync: Mutex<()>,
+    /// Which stored attachment files belong to which message, so remote deletes can remove
+    /// them (security review F1).
+    attachment_index: RefCell<AttachmentIndex>,
+    /// Attachment downloads deferred out of the receive loop (F4): bounded queue, one download
+    /// at a time, a timeout each, and Corvus is notified when a file is ready.
+    download_tx: mpsc::Sender<DownloadJob>,
+    download_rx: RefCell<Option<mpsc::Receiver<DownloadJob>>>,
+    /// Pointers of messages from hidden (unaccepted) senders (F4): nothing is downloaded for
+    /// them automatically; Corvus calls downloadAttachment once the request is accepted.
+    pending_pointers: RefCell<VecDeque<(String, AttachmentPointer, Option<String>)>>,
 }
 
 pub(crate) enum Target {
@@ -130,11 +157,16 @@ impl Daemon {
         let self_aci = Uuid::from(data.service_ids.aci());
         let attachments = attachments_dir(account_dir);
         private_dir(&attachments)?;
+        let attachment_index = AttachmentIndex::load(account_dir, crypto.as_ref());
+        // Fail closed (L1): a trust store that cannot be opened (replaced, corrupt, wrong
+        // secret) stops the run instead of accepting every key again as unverified.
+        let trust = TrustStore::load(account_dir, crypto.clone())?;
         let (receipt_tx, receipt_rx) = mpsc::unbounded_channel();
+        let (download_tx, download_rx) = mpsc::channel(DOWNLOAD_QUEUE_CAPACITY);
         let daemon = Rc::new(Self {
             manager,
             out,
-            trust: RefCell::new(TrustStore::load(account_dir, crypto.clone())),
+            trust: RefCell::new(trust),
             group_extras: Default::default(),
             storage_state: Default::default(),
             attachments,
@@ -152,9 +184,17 @@ impl Daemon {
             typing_state: Default::default(),
             decryption_reset_retry_at: Default::default(),
             pack_sync: Mutex::new(()),
+            attachment_index: RefCell::new(attachment_index),
+            download_tx,
+            download_rx: RefCell::new(Some(download_rx)),
+            pending_pointers: Default::default(),
         });
         daemon.reload_directory().await;
         daemon.reload_groups().await;
+        // presage stored every message it ever handled; Corvus keeps the history, so the
+        // store's copy goes now (F1), and with it the attachments no one cleaned up.
+        daemon.purge_messages().await;
+        daemon.sweep_old_attachments().await;
         Ok(daemon)
     }
 
@@ -165,6 +205,38 @@ impl Daemon {
         tokio::task::spawn_local(async move {
             daemon.receipt_worker(receiver).await;
         });
+    }
+
+    /// Starts the single attachment download worker on the local task set (F4).
+    pub(crate) fn start_download_worker(self: &Rc<Self>) {
+        let Some(receiver) = self.download_rx.borrow_mut().take() else { return };
+        let daemon = Rc::clone(self);
+        tokio::task::spawn_local(async move {
+            daemon.download_worker(receiver).await;
+        });
+    }
+
+    /// Downloads what the queue holds, one at a time, each with a timeout (F4). A file that is
+    /// ready is reported to Corvus, which may have shown the message before it existed; older
+    /// Corvus versions ignore the notification method and fetch lazily as before.
+    async fn download_worker(self: Rc<Self>, mut receiver: mpsc::Receiver<DownloadJob>) {
+        while let Some((pointer, name)) = receiver.recv().await {
+            let _ = tokio::time::timeout(DOWNLOAD_TIMEOUT, self.download(&pointer, name.clone())).await;
+            let id = name.or_else(|| envelope::attachment_id(&pointer));
+            if let Some(id) = id.filter(|id| self.attachments.join(id).exists()) {
+                let _ = self
+                    .emit(rpc::notification("attachmentDownloaded", json!({"id": id, "account": self.account})))
+                    .await;
+            }
+        }
+    }
+
+    /// Hands a download to the background worker. A full queue means a flood: the file is
+    /// skipped instead of piling up unbounded work (F4).
+    fn queue_download(&self, pointer: &AttachmentPointer, name: Option<String>) {
+        if self.download_tx.try_send((pointer.clone(), name)).is_err() {
+            debug!("attachment download queue is full; not downloading");
+        }
     }
 
     /// Collects nearby receipts, combines timestamps per recipient/type, and sends them serially.
@@ -619,6 +691,8 @@ impl Daemon {
                 }
             }
         }
+        // presage stored a sent transcript for every send; it must not linger either (F1).
+        self.purge_messages().await;
         Ok(json!({"timestamp": timestamp, "results": results}))
     }
 
@@ -819,11 +893,19 @@ impl Daemon {
             // Like signal-cli: messages from blocked people and groups are ignored.
             debug!("ignoring a message from a blocked contact or group");
             return false;
+        } else if !self.group_message_allowed(sender, &content.body).await {
+            // Like signal-cli and the official clients: a group message is only shown when the
+            // sender is a member of the group it names (F3). Everything in the group context is
+            // sender-controlled, and the master key leaks with every invite link — without this
+            // check, a removed member could keep posting into the group as far as Corvus sees.
+            debug!(sender = %sender, "dropping a group message from someone who is not in the group");
+            return false;
         }
         self.ensure_person(sender).await;
-        if sender != self.self_aci {
-            self.trust_level(sender).await; // remembers a first key (trust on first use)
-        }
+        // Trust on first use: the first key is remembered as unverified; a changed one stays
+        // untrusted until the user accepts it (L6).
+        let untrusted_identity =
+            sender != self.self_aci && self.trust_level(sender).await.map(|t| t.1) == Some(Level::Untrusted);
         let mut pointers = Vec::new();
         match &content.body {
             ContentBody::DataMessage(dm) => {
@@ -845,20 +927,66 @@ impl Daemon {
             }
             _ => {}
         }
-        // Like signal-cli: attachments are downloaded before the message is announced.
-        for pointer in pointers {
-            self.download(&pointer, None).await;
+        // The message is announced before its attachments are downloaded (F4): a stranger
+        // cannot stall the receive loop with big files, and Corvus sees the message right
+        // away. The background worker (bounded queue, timeout each) notifies Corvus when a
+        // file is ready.
+        let stickers = sticker_pointers(&content.body);
+        // The ids the index keeps for remote deletes (F1): the names everything is stored under.
+        let mut ids: Vec<String> = pointers.iter().filter_map(envelope::attachment_id).collect();
+        ids.extend(stickers.iter().map(|(_, name)| name.clone()));
+        let pointers = filtered_for_download(&pointers);
+        let hidden = sender != self.self_aci && self.storage_state.borrow().hidden.contains(&sender);
+        if hidden {
+            // A message request is never downloaded automatically (F4): nothing is fetched
+            // until Corvus accepts it and calls downloadAttachment. The pointers are kept
+            // (bounded) so that call can still fetch them.
+            let mut pending = self.pending_pointers.borrow_mut();
+            for (pointer, name) in pointers.into_iter().map(|p| (p, None)).chain(stickers.into_iter().map(|(p, n)| (p, Some(n)))) {
+                let Some(id) = envelope::attachment_id(&pointer) else { continue };
+                while pending.len() >= PENDING_POINTER_CACHE {
+                    pending.pop_front();
+                }
+                pending.push_back((id, pointer, name));
+            }
+        } else {
+            for pointer in &pointers {
+                self.queue_download(pointer, None);
+            }
+            for (pointer, name) in &stickers {
+                self.queue_download(pointer, Some(name.clone()));
+            }
         }
-        for (pointer, name) in sticker_pointers(&content.body) {
-            self.download(&pointer, Some(name)).await;
+        // A remote delete removes the message in Corvus; the files of its attachments must go
+        // too (F1). The index below remembers which stored files belonged to which message.
+        if let Some(timestamp) = remote_delete_target(&content.body) {
+            for id in self.attachment_index.borrow_mut().take(sender, timestamp).unwrap_or_default() {
+                if let Err(e) = tokio::fs::remove_file(self.attachments.join(&id)).await {
+                    debug!(%e, id, "cannot remove the attachment of a remotely deleted message");
+                }
+            }
         }
         let envelope = envelope::to_envelope(&self.dir.borrow(), content);
+        let envelope = envelope.map(|mut env| {
+            if untrusted_identity {
+                envelope::set_untrusted(&mut env);
+            }
+            env
+        });
         if let Some(envelope) = envelope {
             if !self.emit(rpc::notification("receive", json!({"envelope": envelope, "account": self.account}))).await {
                 warn!("cannot forward received message to Corvus; leaving it unacknowledged");
                 return false;
             }
         }
+        // The notification reached Corvus (or the message stays unacknowledged and Signal
+        // delivers it again): presage's own copy of the message has served its purpose. Corvus
+        // keeps the history, so the store must not become a second, never-pruned copy of every
+        // message (F1) — only which files belong to which message is kept, for remote deletes.
+        if let Some(timestamp) = message_timestamp(&content.body).filter(|_| !ids.is_empty()) {
+            self.attachment_index.borrow_mut().remember(sender, timestamp, ids);
+        }
+        self.purge_messages().await;
         true
     }
 
@@ -891,6 +1019,42 @@ impl Daemon {
         ctx?.master_key.as_deref()?.try_into().ok()
     }
 
+    /// Whether a group message may be shown: only when the sender is a member of the group it
+    /// names (security review F3). presage upserts the group the message's master key names
+    /// from the server before the content reaches this function, so a message in a group we
+    /// belong to always finds it here; pending or requesting members are allowed only while
+    /// the message carries a group change (their join announcement). An unknown group cannot
+    /// prove membership and is dropped, like signal-cli and the official clients do.
+    async fn group_message_allowed(&self, sender: Uuid, body: &ContentBody) -> bool {
+        match body {
+            // Typing carries the 16-byte group identifier, not the master key; only groups we
+            // know (and whose state is in the store) can be checked. A 1:1 typing indicator
+            // has no group and is always allowed.
+            ContentBody::TypingMessage(t) => {
+                let Some(id) = t.group_id.as_deref().map(|g| BASE64_STANDARD.encode(g)) else { return true };
+                let Some(key) = self.group_keys.borrow().get(&id).copied() else { return false };
+                matches!(
+                    self.store().group(key).await,
+                    Ok(Some(group)) if group_member_or_pending(&group, sender, false)
+                )
+            }
+            _ => {
+                let Some(key) = self.group_of(body) else { return true };
+                let change = match body {
+                    ContentBody::DataMessage(dm) => group_change_present(dm.group_v2.as_ref()),
+                    ContentBody::EditMessage(EditMessage { data_message: Some(dm), .. }) => {
+                        group_change_present(dm.group_v2.as_ref())
+                    }
+                    _ => false,
+                };
+                matches!(
+                    self.store().group(key).await,
+                    Ok(Some(group)) if group_member_or_pending(&group, sender, change)
+                )
+            }
+        }
+    }
+
     pub(crate) fn attachments_path(&self, name: &str) -> PathBuf {
         self.attachments.join(name)
     }
@@ -911,6 +1075,63 @@ impl Daemon {
                 }
             }
             Err(e) => warn!(%e, id, "cannot download attachment"),
+        }
+    }
+
+    /// Clears presage's own copy of the message history (F1). Corvus keeps the history; the
+    /// store must not become a second, never-pruned copy of every message, attachment and
+    /// edit. presage itself only reads old messages to apply edits and remote deletes to its
+    /// own copy — which is removed here right away anyway, before Corvus has anything to
+    /// apply them to.
+    async fn purge_messages(&self) {
+        let mut store = self.store().clone();
+        if let Err(e) = store.clear_messages().await {
+            warn!(%e, "cannot clear presage's stored message history");
+        }
+    }
+
+    /// Backstop for F1: attachments of messages that expired, were deleted or were opened
+    /// view-once are removed actively (deleteAttachment RPC, remote deletes); files that no
+    /// one asked for in this many days are swept at startup, so the folder cannot grow for
+    /// ever. Corvus keeps the message history — a file it still serves after the sweep
+    /// cannot be fetched again.
+    async fn sweep_old_attachments(&self) {
+        const SWEEP_AFTER_DAYS: u64 = 30;
+        let cutoff = now_ms().saturating_sub(SWEEP_AFTER_DAYS.saturating_mul(86_400_000));
+        let Ok(mut entries) = tokio::fs::read_dir(&self.attachments).await else { return };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Ok(meta) = entry.metadata().await else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            // 0 means "unknown modification time"; such a file is kept.
+            if modified != 0 && modified < cutoff {
+                if let Err(e) = tokio::fs::remove_file(entry.path()).await {
+                    debug!(%e, id = %entry.file_name().to_string_lossy(), "cannot sweep an old attachment");
+                }
+            }
+        }
+    }
+
+    /// Removes a stored attachment file (Corvus calls this when a message expires, is deleted
+    /// or a view-once was opened — see the security review, F1).
+    async fn delete_attachment(&self, p: &Params) -> RpcResult {
+        let id = p.required_str("id")?;
+        if !valid_attachment_id(id) {
+            return Err(RpcError::invalid("invalid attachment id"));
+        }
+        match tokio::fs::remove_file(self.attachments.join(id)).await {
+            Ok(()) => Ok(json!({})),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(RpcError::failed("Could not find attachment"))
+            }
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -941,6 +1162,8 @@ impl Daemon {
             "sendReceipt" => self.send_receipt(p).await,
             "sendTyping" => self.send_typing(p).await,
             "getAttachment" => self.get_attachment(p).await,
+            "downloadAttachment" => self.download_attachment(p).await,
+            "deleteAttachment" => self.delete_attachment(p).await,
             "getAvatar" => self.get_avatar(p).await,
             "updateContact" => self.update_contact(p).await,
             "listIdentities" => self.list_identities(p).await,
@@ -1476,13 +1699,56 @@ impl Daemon {
 
     async fn get_attachment(&self, p: &Params) -> RpcResult {
         let id = p.required_str("id")?;
-        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        if !valid_attachment_id(id) {
             return Err(RpcError::invalid("invalid attachment id"));
         }
-        let data = read_maybe_encrypted(&self.attachments.join(&id), &id, self.crypto.as_ref())
+        let data = self
+            .read_stored(id)
             .await
             .map_err(|_| RpcError::failed("Could not find attachment"))?;
         Ok(json!({"data": BASE64_STANDARD.encode(data)}))
+    }
+
+    /// Reads a file stored in the attachments dir. With a secret, stored files are frames (the
+    /// migration encrypted the leftovers at startup, new ones are written encrypted): a
+    /// plaintext file in their place is not served (L1). Files Corvus passes to `send` are
+    /// read leniently instead (read_maybe_encrypted) — they are not stored data.
+    pub(crate) async fn read_stored(&self, name: &str) -> anyhow::Result<Vec<u8>> {
+        let path = self.attachments.join(name);
+        match self.crypto.as_ref() {
+            Some(crypto) => {
+                let data = tokio::fs::read(&path).await?;
+                crypto.open(crypto::purpose::ATTACH, name, &data)
+            }
+            None => Ok(tokio::fs::read(&path).await?),
+        }
+    }
+
+    /// Downloads the attachment of a message from a hidden (unaccepted) sender on demand (F4):
+    /// nothing is fetched automatically for message requests. Corvus calls this once the
+    /// request is accepted, with the id from the envelope; the pointers of those messages are
+    /// kept (bounded) for exactly this. For any other id, the file must exist already.
+    async fn download_attachment(&self, p: &Params) -> RpcResult {
+        let id = p.required_str("id")?;
+        if !valid_attachment_id(id) {
+            return Err(RpcError::invalid("invalid attachment id"));
+        }
+        if !self.attachments.join(id).exists() {
+            let pointer = self
+                .pending_pointers
+                .borrow_mut()
+                .iter()
+                .find(|(pending, _, _)| pending == id)
+                .map(|(_, pointer, name)| (pointer.clone(), name.clone()));
+            let Some((pointer, name)) = pointer else {
+                return Err(RpcError::failed("Could not find attachment"));
+            };
+            match tokio::time::timeout(DOWNLOAD_TIMEOUT, self.download(&pointer, name)).await {
+                Ok(()) => {}
+                Err(_) => return Err(RpcError::failed("download timed out")),
+            }
+        }
+        self.get_attachment(p).await
     }
 
     async fn get_avatar(&self, p: &Params) -> RpcResult {
@@ -1580,7 +1846,8 @@ fn signal_retry_after(message: &str) -> Option<Duration> {
     Some(Duration::from_secs(seconds))
 }
 
-/// The image of a received sticker, kept so getSticker works for packs that are not installed.
+/// The image of a received sticker, kept so getAttachment serves it for packs that are not
+/// installed. The file name comes from the attachment id, not from the sender-chosen pack (F5).
 fn sticker_pointers(body: &ContentBody) -> Vec<(AttachmentPointer, String)> {
     let dm = match body {
         ContentBody::DataMessage(dm) => Some(dm),
@@ -1591,7 +1858,11 @@ fn sticker_pointers(body: &ContentBody) -> Vec<(AttachmentPointer, String)> {
         _ => None,
     };
     dm.and_then(|dm| dm.sticker.as_ref())
-        .and_then(|s| Some((s.data.clone()?, crate::stickers::received_sticker_file(s.pack_id.as_deref()?, s.sticker_id?))))
+        .and_then(|s| {
+            let pointer = s.data.clone()?;
+            let id = envelope::attachment_id(&pointer)?;
+            Some((pointer, crate::stickers::received_sticker_file(&id)))
+        })
         .into_iter()
         .collect()
 }
@@ -1601,13 +1872,186 @@ fn collect_pointers(dm: &DataMessage, out: &mut Vec<AttachmentPointer>) {
     out.extend(dm.preview.iter().filter_map(|p| p.image.clone()));
 }
 
+/// The pointers that are downloaded automatically (F4): Signal clients send at most 32
+/// attachments per message; anything that declares more than 100 MiB is skipped, and the
+/// per-message total is capped. Pointers without a usable id are skipped (they cannot be
+/// fetched later either). Stickers go through the same size limit but not the count cap:
+/// there is at most one per message.
+fn filtered_for_download(pointers: &[AttachmentPointer]) -> Vec<AttachmentPointer> {
+    let mut out = Vec::new();
+    let mut total = 0u64;
+    for pointer in pointers {
+        if out.len() >= MAX_ATTACHMENTS_PER_MESSAGE || total >= MAX_ATTACHMENT_BYTES_PER_MESSAGE {
+            break;
+        }
+        let Some(id) = envelope::attachment_id(pointer) else { continue };
+        let size = u64::try_from(pointer.size.unwrap_or(0)).unwrap_or(u64::MAX);
+        if size > MAX_ATTACHMENT_BYTES {
+            debug!(id, size, "skipping an attachment over the size limit");
+            continue;
+        }
+        total += size;
+        out.push(pointer.clone());
+    }
+    out
+}
+
+/// Only file-name-safe ids are stored under attachments/ and served by getAttachment.
+pub(crate) fn valid_attachment_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The timestamp a remote delete points at, if this message is one.
+fn remote_delete_target(body: &ContentBody) -> Option<u64> {
+    match body {
+        ContentBody::DataMessage(dm) => dm.delete.as_ref().and_then(|d| d.target_sent_timestamp),
+        ContentBody::SynchronizeMessage(sync) => match &sync.content {
+            Some(SyncContent::Sent(sent)) => sent
+                .message
+                .as_ref()
+                .and_then(|dm| dm.delete.as_ref())
+                .and_then(|d| d.target_sent_timestamp),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The timestamp of the message itself (the attachment index is keyed by sender and timestamp).
+fn message_timestamp(body: &ContentBody) -> Option<u64> {
+    match body {
+        ContentBody::DataMessage(dm) => dm.timestamp,
+        ContentBody::EditMessage(EditMessage { data_message: Some(dm), .. }) => dm.timestamp,
+        ContentBody::SynchronizeMessage(sync) => match &sync.content {
+            Some(SyncContent::Sent(sent)) => sent
+                .edit_message
+                .as_ref()
+                .and_then(|e| e.data_message.as_ref())
+                .and_then(|dm| dm.timestamp)
+                .or_else(|| sent.message.as_ref().and_then(|dm| dm.timestamp)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether the message's group context announces a group change.
+fn group_change_present(ctx: Option<&GroupContextV2>) -> bool {
+    ctx.and_then(|c| c.group_change.as_ref()).is_some_and(|c| !c.is_empty())
+}
+
+/// Whether `sender` is a member of `group` (F3). A pending or requesting member may only send
+/// while a group change is present: that is their join announcement, which other members need
+/// to see; any other message from them is not theirs to send yet.
+fn group_member_or_pending(group: &Group, sender: Uuid, change: bool) -> bool {
+    let member = group.members.iter().any(|m| Uuid::from(m.aci) == sender);
+    let pending = change
+        && (group.pending_members.iter().any(|m| m.uuid == sender)
+            || group.requesting_members.iter().any(|m| Uuid::from(m.aci) == sender));
+    member || pending
+}
+
+/// Which stored attachment files belong to which message, so a remote delete can remove them
+/// (security review F1). Corvus calls deleteAttachment when a message expires, is deleted or
+/// a view-once was opened; this index covers remote deletes, which arrive without any RPC.
+/// It is kept small: entries expire after 30 days, and the file lives in the account
+/// directory, encrypted when a secret unlocked the data.
+struct AttachmentIndex {
+    /// "<sender uuid>:<message timestamp>" -> (added at, attachment/sticker file ids)
+    entries: BTreeMap<String, (u64, Vec<String>)>,
+    /// The plaintext path; when a secret unlocked the data, the file lives at `<path>.enc`.
+    path: PathBuf,
+    crypto: Option<Crypto>,
+}
+
+impl AttachmentIndex {
+    const NAME: &str = "attachments-index.json";
+    const MAX_AGE_MS: u64 = 30 * 86_400_000;
+    const MAX_ENTRIES: usize = 512;
+
+    fn load(account_dir: &Path, crypto: Option<&Crypto>) -> Self {
+        let path = account_dir.join(Self::NAME);
+        let enc_path = path.with_extension("json.enc");
+        let entries = match crypto {
+            Some(crypto) => match crypto.read_file(crypto::purpose::ATTACH, Self::NAME, &enc_path) {
+                Ok(data) => parse_index(&data),
+                Err(e) if enc_path.exists() => {
+                    warn!(%e, "cannot read the attachment index; remote deletes will not free their files");
+                    Default::default()
+                }
+                Err(_) => Default::default(),
+            },
+            None => std::fs::read(&path).map(|data| parse_index(&data)).unwrap_or_default(),
+        };
+        Self { entries, path, crypto: crypto.cloned() }
+    }
+
+    fn remember(&mut self, sender: Uuid, timestamp: u64, ids: Vec<String>) {
+        if timestamp == 0 || ids.is_empty() {
+            return;
+        }
+        let now = now_ms();
+        self.entries.retain(|_, (added, _)| now.saturating_sub(*added) < Self::MAX_AGE_MS);
+        self.entries.insert(format!("{sender}:{timestamp}"), (now, ids));
+        while self.entries.len() > Self::MAX_ENTRIES {
+            self.entries.pop_first();
+        }
+        self.save();
+    }
+
+    /// Removes (and returns) the stored ids of a deleted message.
+    fn take(&mut self, sender: Uuid, timestamp: u64) -> Option<Vec<String>> {
+        let ids = self.entries.remove(&format!("{sender}:{timestamp}")).map(|(_, ids)| ids);
+        if ids.is_some() {
+            self.save();
+        }
+        ids
+    }
+
+    fn save(&self) {
+        let mut map = serde_json::Map::new();
+        for (key, (added, ids)) in &self.entries {
+            map.insert(key.clone(), json!({"added": added, "ids": ids}));
+        }
+        let data = Value::Object(map).to_string();
+        let written = match &self.crypto {
+            Some(crypto) => {
+                crypto.seal_file(crypto::purpose::ATTACH, Self::NAME, &self.path.with_extension("json.enc"), data.as_bytes())
+            }
+            // Plaintext mode: before any secret unlocked this data (see crypto.rs).
+            None => crate::store::write_private_file(&self.path, data.as_bytes()).map_err(anyhow::Error::from),
+        };
+        if let Err(e) = written {
+            warn!(%e, "cannot save the attachment index");
+        }
+    }
+}
+
+fn parse_index(data: &[u8]) -> BTreeMap<String, (u64, Vec<String>)> {
+    let mut out = BTreeMap::new();
+    if let Some(Value::Object(map)) = serde_json::from_slice(data).ok() {
+        for (key, value) in map {
+            let ids = value["ids"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect::<Vec<String>>());
+            if let (Some(ids), Some(added)) = (ids, value["added"].as_u64()) {
+                out.insert(key, (added, ids));
+            }
+        }
+    }
+    out
+}
+
 async fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("part");
-    tokio::fs::write(&tmp, data).await?;
+    // 0600 from the moment of creation (L7), like crypto::write_atomic's files; narrowing the
+    // permissions afterwards leaves a window a second could read.
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
+    options.mode(0o600);
     {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).await?;
+        use tokio::io::AsyncWriteExt as _;
+        let mut f = options.open(&tmp).await?;
+        f.write_all(data).await?;
     }
     tokio::fs::rename(tmp, path).await
 }
@@ -1687,5 +2131,192 @@ mod receipt_queue_tests {
             session_reset_backoff("network unavailable"),
             Duration::from_secs(60)
         );
+    }
+}
+
+#[cfg(test)]
+mod attachment_index_tests {
+    use super::*;
+    use crate::crypto;
+
+    fn tmp(name: &str) -> PathBuf {        let dir = std::env::temp_dir().join(format!("corvus-cli-attach-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    const SENDER: Uuid = Uuid::from_u128(0x4444_4444_4444_4444_8444_4444_4444_4444);
+
+    #[test]
+    fn remembers_takes_and_persists_ids() {
+        let dir = tmp("roundtrip");
+        let mut index = AttachmentIndex::load(&dir, None);
+        // Nothing is known about a message that was never seen.
+        assert!(index.take(SENDER, 1).is_none());
+        index.remember(SENDER, 1, vec!["a1".into(), "a2".into()]);
+        // A restart reads the same entries back (plaintext mode: no secret, plain file).
+        let mut again = AttachmentIndex::load(&dir, None);
+        assert_eq!(again.take(SENDER, 1).unwrap(), ["a1", "a2"]);
+        // take removes the entry: a second delete finds nothing.
+        assert!(again.take(SENDER, 1).is_none());
+        // Messages without timestamp or without attachments are not recorded.
+        index.remember(SENDER, 0, vec!["x".into()]);
+        index.remember(SENDER, 2, vec![]);
+        let mut fresh = AttachmentIndex::load(&dir, None);
+        assert!(fresh.take(SENDER, 0).is_none());
+        assert!(fresh.take(SENDER, 2).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_stored_index_is_encrypted_with_the_rest_of_the_data() {
+        let dir = tmp("encrypted");
+        let crypto = crypto::unlock(&dir, "pw", None).unwrap();
+        let mut index = AttachmentIndex::load(&dir, Some(&crypto));
+        index.remember(SENDER, 5, vec!["file1".into()]);
+        assert!(dir.join("attachments-index.json.enc").exists());
+        assert!(!dir.join("attachments-index.json").exists());
+        // The ids are not readable on disk.
+        let raw = std::fs::read(dir.join("attachments-index.json.enc")).unwrap();
+        assert!(!raw.windows(5).any(|w| w == b"file1"));
+        // And a restart (with the same secret) reads them back.
+        let mut again = AttachmentIndex::load(&dir, Some(&crypto::unlock(&dir, "pw", None).unwrap()));
+        assert_eq!(again.take(SENDER, 5).unwrap(), ["file1"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_file_name_safe_ids_are_valid() {
+        assert!(valid_attachment_id("a-b_C9"));
+        assert!(!valid_attachment_id(""));
+        assert!(!valid_attachment_id("../secret"));
+        assert!(!valid_attachment_id("a/b"));
+        assert!(!valid_attachment_id("a.b"));
+    }
+}
+
+#[cfg(test)]
+mod download_caps_tests {
+    use super::*;
+    use presage::proto::attachment_pointer::AttachmentIdentifier;
+
+    fn pointer(key: &str, size: Option<u32>) -> AttachmentPointer {
+        AttachmentPointer {
+            attachment_identifier: Some(AttachmentIdentifier::CdnKey(key.into())),
+            content_type: Some("image/png".into()),
+            size,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn at_most_32_attachments_per_message() {
+        let pointers: Vec<_> = (0..100).map(|i| pointer(&format!("a{i}"), Some(1))).collect();
+        let filtered = filtered_for_download(&pointers);
+        assert_eq!(filtered.len(), MAX_ATTACHMENTS_PER_MESSAGE);
+        // The first ones in order: nothing is dropped arbitrarily.
+        assert_eq!(envelope::attachment_id(&filtered[0]).as_deref(), Some("a0"));
+        assert_eq!(envelope::attachment_id(&filtered[31]).as_deref(), Some("a31"));
+    }
+
+    #[test]
+    fn oversized_attachments_are_skipped() {
+        let pointers = vec![pointer("small", Some(1)), pointer("huge", Some(MAX_ATTACHMENT_BYTES as u32 + 1)), pointer("small2", Some(1))];
+        let filtered = filtered_for_download(&pointers);
+        let ids: Vec<_> = filtered.iter().filter_map(envelope::attachment_id).collect();
+        assert_eq!(ids, ["small", "small2"]);
+    }
+
+    #[test]
+    fn the_total_bytes_per_message_are_capped() {
+        // Each is under the single-file limit, together they exceed the message limit.
+        let pointers: Vec<_> = (0..MAX_ATTACHMENTS_PER_MESSAGE * 2)
+            .map(|i| pointer(&format!("b{i}"), Some((MAX_ATTACHMENT_BYTES_PER_MESSAGE / 16) as u32)))
+            .collect();
+        let filtered = filtered_for_download(&pointers);
+        assert!(filtered.len() < MAX_ATTACHMENTS_PER_MESSAGE);
+        assert!(filtered.len() >= 16);
+    }
+
+    #[test]
+    fn pointers_without_id_are_not_downloaded() {
+        let pointers = vec![AttachmentPointer::default(), pointer("ok", Some(1))];
+        let filtered = filtered_for_download(&pointers);
+        let ids: Vec<_> = filtered.iter().filter_map(envelope::attachment_id).collect();
+        assert_eq!(ids, ["ok"]);
+    }
+}
+
+#[cfg(test)]
+mod group_membership_tests {
+    use super::*;
+    use presage::libsignal_service::groups_v2::Role;
+    use presage::libsignal_service::prelude::ProfileKey;
+    use presage::model::groups::{Member, PendingMember, RequestingMember};
+
+    const ALICE: Uuid = Uuid::from_u128(0x1111_1111_1111_4111_8111_1111_1111_1111);
+    const BOB: Uuid = Uuid::from_u128(0x2222_2222_2222_4222_8222_2222_2222_2222);
+
+    /// A group with ALICE as its only full member.
+    fn group(pending: &[Uuid], requesting: &[Uuid]) -> Group {
+        Group {
+            title: "Team".into(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: None,
+            revision: 3,
+            members: vec![Member {
+                aci: ALICE.into(),
+                role: Role::Default,
+                profile_key: ProfileKey::create([0; 32]),
+                joined_at_revision: 0,
+                label: None,
+                label_emoji: None,
+            }],
+            pending_members: pending
+                .iter()
+                .map(|uuid| PendingMember {
+                    uuid: *uuid,
+                    service_id_type: presage::model::ServiceIdType::AccountIdentity,
+                    role: Role::Default,
+                    added_by_aci: ALICE.into(),
+                    timestamp: 1,
+                })
+                .collect(),
+            requesting_members: requesting
+                .iter()
+                .map(|uuid| RequestingMember { aci: (*uuid).into(), profile_key: ProfileKey::create([0; 32]), timestamp: 1 })
+                .collect(),
+            invite_link_password: vec![9; 16],
+            description: None,
+        }
+    }
+
+    #[test]
+    fn only_members_may_send() {
+        let group = group(&[], &[]);
+        // A member may send; anyone else — removed member, invite-link holder — may not (F3).
+        assert!(group_member_or_pending(&group, ALICE, false));
+        assert!(!group_member_or_pending(&group, BOB, false));
+    }
+
+    #[test]
+    fn pending_and_requesting_members_only_during_a_change() {
+        let group = group(&[BOB], &[BOB]);
+        // Their join announcement carries a group change and must reach the members.
+        assert!(group_member_or_pending(&group, BOB, true));
+        // Everything else from a not-yet-member is dropped.
+        assert!(!group_member_or_pending(&group, BOB, false));
+    }
+
+    #[test]
+    fn a_group_change_is_recognised() {
+        // The group change travels as its serialized bytes.
+        let empty = GroupContextV2 { master_key: Some([7; 32].to_vec()), revision: Some(3), group_change: None };
+        let mut announced = empty.clone();
+        announced.group_change = Some(vec![1, 2, 3]);
+        assert!(!group_change_present(Some(&empty)));
+        assert!(group_change_present(Some(&announced)));
+        assert!(!group_change_present(None));
     }
 }

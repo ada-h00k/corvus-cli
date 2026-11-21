@@ -11,7 +11,12 @@ depends=('gcc-libs' 'glibc' 'openssl')
 source=('corvus-cli' 'LICENSE' 'README.md')
 noextract=('corvus-cli')
 options=('!debug')
-sha256sums=('SKIP' 'SKIP' 'SKIP')
+# The binary is produced by the release workflow (build-arch-package) and cannot have a
+# static checksum here; its integrity is covered by the SHA256SUMS the release ships.
+# The static files are pinned: makepkg verifies them against these sums.
+sha256sums=('SKIP'
+            '8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef'
+            '5dd5140c8c9fbe440a3b099db2143b42439cea0f779ce5d3dd699f54bb6ee7b4')
 
 package() {
   install -Dm755 "${srcdir}/corvus-cli" "${pkgdir}/usr/bin/corvus-cli"

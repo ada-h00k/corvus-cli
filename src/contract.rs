@@ -271,6 +271,13 @@ fn cases() -> Value {
         action: Some(Action::Started as i32),
         group_id: Some(base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &group_id).unwrap()),
     };
+    // An envelope from an identity the user has not accepted carries the mark Corvus warns
+    // about (L6); the daemon sets it after to_envelope, exactly like this.
+    let untrusted_sticker = {
+        let mut marked = notification(ALICE, ContentBody::DataMessage(sticker.clone()));
+        envelope::set_untrusted(&mut marked["params"]["envelope"]);
+        marked
+    };
 
     let group = Group {
         title: "Team".into(),
@@ -319,6 +326,7 @@ fn cases() -> Value {
         "readReceipt": notification(ALICE, ContentBody::ReceiptMessage(read)),
         "deliveryReceipt": notification(ALICE, ContentBody::ReceiptMessage(delivery)),
         "groupTyping": notification(ALICE, ContentBody::TypingMessage(typing)),
+        "untrustedSticker": untrusted_sticker,
         "listGroups": [listed],
     })
 }

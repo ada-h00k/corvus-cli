@@ -117,11 +117,13 @@ fn option(rest: &[String], short: &str, long: &str) -> Option<String> {
 }
 
 fn init_logging(verbosity: u8) {
-    // stderr is shown to the user by corvus, so only problems are logged by default.
+    // stderr is shown to the user by corvus, so only problems are logged by default. Even at
+    // the highest verbosity the wire libraries stay quiet (L5): at that level they log message
+    // metadata and contents, which corvus shows and may keep.
     let default = match verbosity {
         0 => "corvus_cli=warn,presage=error,libsignal_service=error",
         1 => "corvus_cli=info,presage=info,libsignal_service=warn",
-        _ => "debug",
+        _ => "corvus_cli=debug,presage=info,libsignal_service=info",
     };
     let filter = tracing_subscriber::EnvFilter::try_from_env("CORVUS_CLI_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
@@ -162,13 +164,18 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let dir = store::data_dir(args.config.as_deref());
     // The secret Corvus unlocked its history with (keychain entry or passphrase) also unlocks
     // the data here. It is passed in the environment instead of the command line, where other
-    // users of the machine could read it. Without a secret the commands still run as long as
-    // nothing is encrypted yet; encrypted data without a secret is a hard error.
-    let secret = std::env::var(crypto::SECRET_ENV).ok().filter(|s| !s.is_empty());
-    let previous = std::env::var(crypto::PREVIOUS_SECRET_ENV).ok().filter(|s| !s.is_empty());
-    let crypto = match secret {
+    // users of the machine could read it; the variables are removed and their contents wiped
+    // right after reading (L2), so the secret does not stay in /proc/<pid>/environ for the
+    // life of the process or leak into child processes. This runs before anything is spawned,
+    // on one thread. Without a secret the commands still run as long as nothing is encrypted
+    // yet; encrypted data without a secret is a hard error.
+    let mut secret = std::env::var(crypto::SECRET_ENV).ok().filter(|s| !s.is_empty());
+    let mut previous = std::env::var(crypto::PREVIOUS_SECRET_ENV).ok().filter(|s| !s.is_empty());
+    std::env::remove_var(crypto::SECRET_ENV);
+    std::env::remove_var(crypto::PREVIOUS_SECRET_ENV);
+    let crypto = match secret.as_deref() {
         Some(secret) => {
-            let crypto = crypto::unlock(&dir, &secret, previous.as_deref())?;
+            let crypto = crypto::unlock(&dir, secret, previous.as_deref())?;
             // Encrypt the plaintext files an older version left behind (one-time; cheap when
             // there is nothing to do).
             store::migrate_legacy(&dir, &crypto)?;
@@ -179,6 +186,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
         }
         None => None,
     };
+    if let Some(secret) = secret.as_mut() {
+        crypto::wipe_str(secret);
+    }
+    if let Some(previous) = previous.as_mut() {
+        crypto::wipe_str(previous);
+    }
     let accounts = Accounts::new(dir, crypto.clone());
     match args.command.as_deref() {
         Some("listAccounts") => list_accounts(&accounts, args.json_output),
@@ -221,7 +234,8 @@ async fn link(accounts: &Accounts, device_name: String, crypto: Option<Crypto>) 
     // Keep a handle to the shared SQLite pool so it can be closed explicitly after
     // linking. Dropping the manager alone does not wait for SQLx connections to close;
     // on Windows this can leave store.db3/WAL files locked when the directory is renamed.
-    let store = open_store(&staging).await?;
+    // With a secret, the staging store is created as an SQLCipher database right away.
+    let store = open_store(&staging, crypto.as_ref()).await?;
     let (url_tx, url_rx) = oneshot::channel();
     let (linked, ()) = future::join(
         Manager::link_secondary_device(store.clone(), SignalServers::Production, device_name, url_tx),
@@ -254,25 +268,18 @@ async fn link(accounts: &Accounts, device_name: String, crypto: Option<Crypto>) 
     // Windows keeps SQLite database/WAL files locked until the pool has fully shut down.
     store.close().await;
     accounts.register(&staging, &number, &aci)?;
-    // The freshly linked store is plaintext while linking (SQLite needs a real file); encrypt
-    // it right away so the account directory holds no readable session keys afterwards.
-    if let Some(crypto) = &crypto {
-        if let Err(e) = store::seal_db(&accounts.account_dir(&aci), crypto) {
-            warn!(%e, "cannot encrypt the freshly linked store; the next start will");
-        }
-    }
+    // The store was created as an SQLCipher database when a secret unlocked the data (or stays
+    // plaintext while nothing is encrypted yet): it moves into place as it is.
     println!("Associated with: {number}");
     Ok(())
 }
 
 async fn json_rpc(accounts: &Accounts, account: &str, crypto: Option<Crypto>) -> anyhow::Result<()> {
     let dir = accounts.find(account)?;
-    // The encrypted store is decrypted to its usual path before presage opens it; a plaintext
-    // store.db3 (older version or crashed run) is used as it is and encrypted on shutdown.
-    if let Some(crypto) = &crypto {
-        store::prepare_db(&dir, crypto)?;
-    }
-    let store: SqliteStore = open_store(&dir).await?;
+    // With a secret, the store is an SQLCipher database keyed with a subkey of the master key:
+    // encrypted at rest from the first byte on, also during the run and after a crash (F2).
+    // The one-time migration of the old at-rest formats happens inside open_store.
+    let store: SqliteStore = open_store(&dir, crypto.as_ref()).await?;
     let manager: Manager<SqliteStore, Registered> = Manager::load_registered(store.clone())
         .await
         .context("account is not linked (link it again)")?;
@@ -287,6 +294,7 @@ async fn json_rpc(accounts: &Accounts, account: &str, crypto: Option<Crypto>) ->
 
     let daemon = daemon::Daemon::new(manager, &dir, out_tx.clone(), crypto.clone()).await?;
     daemon.start_receipt_worker();
+    daemon.start_download_worker();
     // Contacts' numbers and names come from the storage service: read it before the first
     // listContacts is answered (requests wait in stdin meanwhile), but not for ever.
     if tokio::time::timeout(std::time::Duration::from_secs(10), daemon.clone().refresh_storage()).await.is_err() {
@@ -341,17 +349,10 @@ async fn json_rpc(accounts: &Accounts, account: &str, crypto: Option<Crypto>) ->
     drop(daemon);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), writer).await;
     // Close the store so the write-ahead log is checkpointed and no file handle stays open
-    // (required before the plaintext database is removed; on Windows, open files cannot be
-    // unlinked). If the store does not close in time, the plaintext stays and the next start
-    // picks it up and encrypts it — no data is lost either way.
-    if tokio::time::timeout(std::time::Duration::from_secs(3), store.close()).await.is_ok() {
-        if let Some(crypto) = &crypto {
-            if let Err(e) = store::seal_db(&dir, crypto) {
-                warn!(%e, "cannot re-encrypt the store; the next start will");
-            }
-        }
-    } else {
-        warn!("the store did not close in time; leaving its plaintext for the next start to encrypt");
+    // (on Windows, open files cannot be unlinked). The store is an SQLCipher database already
+    // (or plaintext while nothing is encrypted yet): nothing is written on shutdown any more.
+    if tokio::time::timeout(std::time::Duration::from_secs(3), store.close()).await.is_err() {
+        warn!("the store did not close in time");
     }
     Ok(())
 }
