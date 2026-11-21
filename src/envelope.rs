@@ -237,6 +237,10 @@ fn data_message_fields(dir: &Directory, dm: &DataMessage, out: &mut Map<String, 
                 "packId": sticker.pack_id.as_deref().map(hex),
                 "stickerId": sticker.sticker_id,
                 "emoji": sticker.emoji,
+                // The id the image of this sticker is stored under (F5): Corvus fetches received
+                // sticker images with getAttachment, so a sender cannot choose another chat's
+                // sticker image by claiming a popular pack.
+                "attachmentId": sticker.data.as_ref().and_then(attachment_id),
             }),
         );
     }

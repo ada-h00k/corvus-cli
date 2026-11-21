@@ -1820,7 +1820,8 @@ fn signal_retry_after(message: &str) -> Option<Duration> {
     Some(Duration::from_secs(seconds))
 }
 
-/// The image of a received sticker, kept so getSticker works for packs that are not installed.
+/// The image of a received sticker, kept so getAttachment serves it for packs that are not
+/// installed. The file name comes from the attachment id, not from the sender-chosen pack (F5).
 fn sticker_pointers(body: &ContentBody) -> Vec<(AttachmentPointer, String)> {
     let dm = match body {
         ContentBody::DataMessage(dm) => Some(dm),
@@ -1831,7 +1832,11 @@ fn sticker_pointers(body: &ContentBody) -> Vec<(AttachmentPointer, String)> {
         _ => None,
     };
     dm.and_then(|dm| dm.sticker.as_ref())
-        .and_then(|s| Some((s.data.clone()?, crate::stickers::received_sticker_file(s.pack_id.as_deref()?, s.sticker_id?))))
+        .and_then(|s| {
+            let pointer = s.data.clone()?;
+            let id = envelope::attachment_id(&pointer)?;
+            Some((pointer, crate::stickers::received_sticker_file(&id)))
+        })
         .into_iter()
         .collect()
 }

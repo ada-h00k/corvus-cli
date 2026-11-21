@@ -456,6 +456,7 @@
           "expiresInSeconds": 0,
           "message": null,
           "sticker": {
+            "attachmentId": "stk1",
             "emoji": "🐢",
             "packId": "abcd",
             "stickerId": 4

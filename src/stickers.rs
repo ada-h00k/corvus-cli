@@ -47,9 +47,14 @@ pub fn parse_pack_uri(uri: &str) -> Option<(Vec<u8>, Vec<u8>)> {
     Some((id?, key?))
 }
 
-/// File name under which the image of a received sticker is kept.
-pub fn received_sticker_file(pack_id: &[u8], sticker_id: u32) -> String {
-    format!("sticker-{}-{}", hex(pack_id), sticker_id)
+/// File name under which the image of a received sticker is kept: keyed by the attachment
+/// pointer's id, not by the pack id and sticker id the sender claims (F5). Everything in a
+/// sticker message is sender-controlled; keyed by the pack, the first sender of a pack id
+/// would decide the image every later sticker of that pack shows. Keyed by the attachment,
+/// every message shows what its own sender sent — and the envelope reports the id, so Corvus
+/// fetches received sticker images with getAttachment.
+pub fn received_sticker_file(attachment_id: &str) -> String {
+    format!("sticker-{attachment_id}")
 }
 
 impl Daemon {
@@ -147,7 +152,9 @@ impl Daemon {
         Ok(json!({}))
     }
 
-    /// From an installed pack, else the copy saved when the sticker was received.
+    /// From an installed pack: the stored image (F5). The image of a received sticker of a
+    /// pack that is not installed is served by getAttachment with the attachmentId the
+    /// envelope reports — a cache addressed by the sender-chosen pack id would be poisonable.
     async fn sticker_bytes(&self, pack_id: &[u8], sticker_id: u32) -> Option<(Vec<u8>, Option<String>)> {
         if let Ok(Some(pack)) = self.store().sticker_pack(pack_id).await {
             if let Some(s) = pack.manifest.stickers.iter().find(|s| s.id == sticker_id) {
@@ -156,9 +163,7 @@ impl Daemon {
                 }
             }
         }
-        let name = received_sticker_file(pack_id, sticker_id);
-        let path = self.attachments_path(&name);
-        crate::daemon::read_maybe_encrypted(&path, &name, self.crypto.as_ref()).await.ok().map(|b| (b, None))
+        None
     }
 
     pub(crate) async fn get_sticker(&self, p: &Params) -> RpcResult {
@@ -281,7 +286,10 @@ mod tests {
         assert!(parse_pack_uri("https://signal.art/addstickers/#pack_id=0a1b").is_none());
         assert!(parse_pack_uri("https://example.org").is_none());
         assert!(parse_pack_uri("https://signal.art/addstickers/#pack_id=0g&pack_key=00").is_none());
-        assert_eq!(received_sticker_file(&[1, 2], 3), "sticker-0102-3");
+        // The received-sticker cache is keyed by the attachment id, not by the pack the sender
+        // claims (F5): two senders claiming the same pack keep their own images apart.
+        assert_eq!(received_sticker_file("ab_c-d9"), "sticker-ab_c-d9");
+        assert_ne!(received_sticker_file("ab_c-d9"), received_sticker_file("zz_z-z9"));
     }
 
     /// A manifest as the sticker CDN serves it, decrypted and decoded the way download_pack does.
