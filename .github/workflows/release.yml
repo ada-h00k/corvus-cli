@@ -43,10 +43,10 @@ jobs:
         # Uniform shell (incl. cp and quoted paths) on all three runners.
         shell: bash
     permissions:
+      # Read-only for every branch push; the attestation signs in the publish job, which
+      # only runs on tags (L3 follow-up: these write scopes were requested here on every
+      # push while the attestation step only ever ran on a tag).
       contents: read
-      # Build provenance is only attested for tagged releases (the step below).
-      id-token: write
-      attestations: write
 
     steps:
       - name: Check out source
@@ -171,8 +171,9 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo dependencies
-        # Swatinem/rust-cache@v2
-        uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a
+        # Swatinem/rust-cache@v2.9.3 — the commit the v2 tag object points to (L3 follow-up:
+        # the annotated tag's own SHA moves with a re-tag; the commit does not).
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           key: ${{ matrix.target }}
 
@@ -182,11 +183,12 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test
 
-      # Advisory check (L3): a known CVE in the dependency tree fails the build.
+      # Advisory check (L3): a known CVE in the dependency tree fails the build. The version
+      # is pinned so a new release cannot change the audit's behavior between runs.
       - name: Check dependencies for known advisories
         if: runner.os == 'Linux'
         run: |
-          cargo install cargo-audit --locked
+          cargo install cargo-audit --locked --version 0.23
           cargo audit
 
       - name: Build release binary
@@ -204,13 +206,8 @@ jobs:
           cp "$VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/"libcrypto*.dll dist/
           (cd dist && 7z a -tzip "../${{ matrix.asset }}" .)
 
-      - name: Attest build provenance
-        if: github.ref_type == 'tag'
-        # actions/attest-build-provenance@v3
-        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661
-        with:
-          subject_path: ${{ matrix.asset }}
-          subject_name: ${{ matrix.asset }}
+      # The build provenance is attested in the publish job (L3 follow-up: the signing
+      # permissions only exist there, and that job only runs on tags).
 
       - name: Upload release asset
         # actions/upload-artifact@v7
@@ -271,8 +268,12 @@ jobs:
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
-      # The one job that may write: it creates the release.
+      # The one job that may write: it creates the release, and the attestation signs
+      # there (L3 follow-up: the signing scopes moved here from the build job, which ran
+      # them on every branch push without ever using them).
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Download release assets
         # actions/download-artifact@v8
@@ -281,6 +282,14 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Attest build provenance
+        # actions/attest-build-provenance@v3.0.0 — the commit the v3 tag object points to
+        # (L3 follow-up: the pin was the annotated tag's own SHA). The subject names come
+        # from the matched paths.
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject_path: release-assets/*
+
       - name: Generate checksums
         run: |
           cd release-assets
@@ -288,8 +297,9 @@ jobs:
           cat SHA256SUMS
 
       - name: Create GitHub release
-        # softprops/action-gh-release@v3
-        uses: softprops/action-gh-release@40c2ca6ddd77ba2a30bbea8f67409c0f76868d67
+        # softprops/action-gh-release@v3.0.4 — the commit the v3 tag object points to
+        # (L3 follow-up: the pin was the annotated tag's own SHA).
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3
         with:
           tag_name: ${{ github.ref_name }}
           name: corvus-cli ${{ github.ref_name }}
