@@ -545,6 +545,16 @@ impl Daemon {
         Ok(self.store().groups().await?.flatten().collect())
     }
 
+    /// Known from the contacts or from the storage service (F4). Hidden requests are handled
+    /// by the caller; group members by the group check.
+    async fn known_sender(&self, sender: Uuid) -> bool {
+        if self.storage_state.borrow().people.contains_key(&sender) {
+            return true;
+        }
+        let Ok(contacts) = self.store().contacts().await else { return false };
+        contacts.flatten().any(|c| c.uuid == sender)
+    }
+
     pub(crate) async fn reload_groups(&self) {
         let Ok(groups) = self.groups().await else { return };
         let mut keys = self.group_keys.borrow_mut();
@@ -937,8 +947,24 @@ impl Daemon {
         let mut ids: Vec<String> = pointers.iter().filter_map(envelope::attachment_id).collect();
         ids.extend(stickers.iter().map(|(_, name)| name.clone()));
         let pointers = filtered_for_download(&pointers);
+        // Downloaded automatically only for accepted senders (F4): self, full members of the
+        // group the message names, and known senders. Everyone else is a message request — a
+        // first-time sender is not in the hidden set, so the old hidden-only gate still
+        // downloaded whatever they sent.
+        let in_group = match self.group_of(&content.body) {
+            Some(key) => matches!(self.store().group(key).await, Ok(Some(group)) if group.is_member(&Aci::from(sender))),
+            None => false,
+        };
         let hidden = sender != self.self_aci && self.storage_state.borrow().hidden.contains(&sender);
-        if hidden {
+        let known = self.known_sender(sender).await;
+        if downloads_automatically(sender, self.self_aci, in_group, known, hidden) {
+            for pointer in &pointers {
+                self.queue_download(pointer, None);
+            }
+            for (pointer, name) in &stickers {
+                self.queue_download(pointer, Some(name.clone()));
+            }
+        } else {
             // A message request is never downloaded automatically (F4): nothing is fetched
             // until Corvus accepts it and calls downloadAttachment. The pointers are kept
             // (bounded) so that call can still fetch them.
@@ -949,13 +975,6 @@ impl Daemon {
                     pending.pop_front();
                 }
                 pending.push_back((id, pointer, name));
-            }
-        } else {
-            for pointer in &pointers {
-                self.queue_download(pointer, None);
-            }
-            for (pointer, name) in &stickers {
-                self.queue_download(pointer, Some(name.clone()));
             }
         }
         // A remote delete removes the message in Corvus; the files of its attachments must go
@@ -1070,6 +1089,12 @@ impl Daemon {
             return;
         }
         match self.manager.get_attachment(pointer).await {
+            // The declared size passed filtered_for_download, but the sender controls it: the
+            // bytes actually received are capped here, too (F4) — the declared cap alone is
+            // only a promise.
+            Ok(data) if data.len() as u64 > MAX_ATTACHMENT_BYTES => {
+                warn!(id, size = data.len(), "not storing an attachment over the size limit");
+            }
             Ok(data) => {
                 if let Err(e) = save_attachment(&path, &id, &data, self.crypto.as_ref()).await {
                     warn!(%e, id, "cannot save attachment");
@@ -1895,6 +1920,14 @@ fn collect_pointers(dm: &DataMessage, out: &mut Vec<AttachmentPointer>) {
     out.extend(dm.preview.iter().filter_map(|p| p.image.clone()));
 }
 
+/// Whether a sender's attachments are downloaded automatically (F4): self, full members of
+/// the group the message names, and senders known from the contacts or the storage service —
+/// unless the user hid the request. Everyone else is a message request; their attachments are
+/// parked until Corvus accepts it and calls downloadAttachment.
+fn downloads_automatically(sender: Uuid, self_aci: Uuid, in_group: bool, known: bool, hidden: bool) -> bool {
+    sender == self_aci || in_group || (!hidden && known)
+}
+
 /// The pointers that are downloaded automatically (F4): Signal clients send at most 32
 /// attachments per message; anything that declares more than 100 MiB is skipped, and the
 /// per-message total is capped. Pointers without a usable id are skipped (they cannot be
@@ -2399,5 +2432,36 @@ mod received_sticker_tests {
         assert_eq!(std::fs::read(dir.join("ee11-22")).unwrap(), b"target");
         assert!(dir.join("sticker-ee11-22").exists());
         assert!(dir.join("keep.webp").exists());
+    }
+}
+
+#[cfg(test)]
+mod accepted_sender_tests {
+    use super::*;
+
+    const ME: Uuid = Uuid::from_u128(0x1111_1111_1111_4111_8111_1111_1111_1111);
+    const STRANGER: Uuid = Uuid::from_u128(0x2222_2222_2222_4222_8222_2222_2222_2222);
+
+    #[test]
+    fn a_first_time_sender_is_not_downloaded_automatically() {
+        // The gate is not the hidden set: a stranger is not hidden, and the old hidden-only
+        // check still downloaded whatever they sent (F4 follow-up).
+        assert!(!downloads_automatically(STRANGER, ME, false, false, false));
+    }
+
+    #[test]
+    fn known_senders_download_unless_the_request_was_hidden() {
+        assert!(downloads_automatically(STRANGER, ME, false, true, false));
+        // The user explicitly hid the request: nothing downloads until they accept.
+        assert!(!downloads_automatically(STRANGER, ME, false, true, true));
+    }
+
+    #[test]
+    fn group_members_and_self_download() {
+        // Membership of the group the message names is accepted (the F3 check ran before).
+        assert!(downloads_automatically(STRANGER, ME, true, false, false));
+        assert!(downloads_automatically(STRANGER, ME, true, false, true));
+        // The other devices of this account are always accepted.
+        assert!(downloads_automatically(ME, ME, false, false, false));
     }
 }
