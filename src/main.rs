@@ -117,11 +117,13 @@ fn option(rest: &[String], short: &str, long: &str) -> Option<String> {
 }
 
 fn init_logging(verbosity: u8) {
-    // stderr is shown to the user by corvus, so only problems are logged by default.
+    // stderr is shown to the user by corvus, so only problems are logged by default. Even at
+    // the highest verbosity the wire libraries stay quiet (L5): at that level they log message
+    // metadata and contents, which corvus shows and may keep.
     let default = match verbosity {
         0 => "corvus_cli=warn,presage=error,libsignal_service=error",
         1 => "corvus_cli=info,presage=info,libsignal_service=warn",
-        _ => "debug",
+        _ => "corvus_cli=debug,presage=info,libsignal_service=info",
     };
     let filter = tracing_subscriber::EnvFilter::try_from_env("CORVUS_CLI_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default));
