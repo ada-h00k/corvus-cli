@@ -103,10 +103,11 @@ impl Accounts {
 
     /// number -> account directory name
     pub fn list(&self) -> BTreeMap<String, String> {
-        // The encrypted index wins; the plaintext one is only read before the migration ran
-        // (it is sealed at startup and never written again) and when no secret is available.
-        // A broken encrypted index is not silently replaced by an empty one from a plaintext
-        // file (L1): the error is reported and no account is found.
+        // While a secret unlocks the data, the encrypted index is the only one trusted (L1):
+        // a plaintext index next to it is either a plant (the startup migration refuses to
+        // seal it) or a downgrade leftover — either way it is not read here. A broken
+        // encrypted index is not silently replaced by an empty one from a plaintext file:
+        // the error is reported and no account is found.
         if let Some(crypto) = &self.crypto {
             if self.index_enc_path().exists() {
                 return match crypto.read_encrypted(crypto::purpose::ACCOUNTS, "", &self.index_enc_path()) {
@@ -117,7 +118,11 @@ impl Accounts {
                     }
                 };
             }
+            // No encrypted index: there was nothing to migrate, a plaintext file here is not
+            // data this version wrote.
+            return Default::default();
         }
+        // Without a secret nothing is encrypted yet; the plaintext index is the real one.
         fs::read(self.index_path())
             .ok()
             .and_then(|data| serde_json::from_slice(&data).ok())
@@ -358,15 +363,24 @@ pub fn attachments_dir(account_dir: &Path) -> PathBuf {
 /// keyring is unlocked, before any command. Cheap when there is nothing to do.
 pub fn migrate_legacy(data_dir: &Path, crypto: &Crypto) -> anyhow::Result<()> {
     let index = data_dir.join("accounts.json");
+    let index_enc = data_dir.join("accounts.json.enc");
     if index.exists() {
-        let data = fs::read(&index).with_context(|| format!("cannot read {}", index.display()))?;
-        crypto.seal_file(crypto::purpose::ACCOUNTS, "", &data_dir.join("accounts.json.enc"), &data)?;
-        wipe_and_remove(&index);
+        if index_enc.exists() {
+            // The migration already ran: an encrypted index exists. A plaintext index next to
+            // it was not written by this program (it seals and removes what it migrates) —
+            // sealing it would overwrite the encrypted store with whatever a process running
+            // as this user planted there (L1). It is reported and left alone; the encrypted
+            // index stays the only one Accounts::list reads.
+            warn!("a plaintext accounts.json exists next to accounts.json.enc; not migrating it");
+        } else {
+            let data = fs::read(&index).with_context(|| format!("cannot read {}", index.display()))?;
+            crypto.seal_file(crypto::purpose::ACCOUNTS, "", &index_enc, &data)?;
+            wipe_and_remove(&index);
+        }
     }
     // The account directory names come from the index, which is encrypted by now. A broken
     // index is not fatal here (migrate_legacy only encrypts leftover files), but the run
     // afterwards cannot find accounts (see Accounts::list).
-    let index_enc = data_dir.join("accounts.json.enc");
     let Ok(data) = crypto.read_encrypted(crypto::purpose::ACCOUNTS, "", &index_enc) else {
         return Ok(());
     };
@@ -376,16 +390,23 @@ pub fn migrate_legacy(data_dir: &Path, crypto: &Crypto) -> anyhow::Result<()> {
     for name in index.into_values() {
         let dir = data_dir.join("accounts").join(name);
         let trust = dir.join("trust.json");
+        let trust_enc = dir.join("trust.json.enc");
         if trust.exists() {
-            match fs::read(&trust) {
-                Ok(data) => {
-                    if let Err(e) = crypto.seal_file(crypto::purpose::TRUST, "", &dir.join("trust.json.enc"), &data) {
-                        warn!(%e, "cannot encrypt the trust store");
-                    } else {
-                        wipe_and_remove(&trust);
+            if trust_enc.exists() {
+                // Same as the index above: the encrypted trust store is the one that counts;
+                // a plaintext file next to it is a plant or a downgrade leftover (L1).
+                warn!("a plaintext trust.json exists next to its encrypted store; not migrating it");
+            } else {
+                match fs::read(&trust) {
+                    Ok(data) => {
+                        if let Err(e) = crypto.seal_file(crypto::purpose::TRUST, "", &trust_enc, &data) {
+                            warn!(%e, "cannot encrypt the trust store");
+                        } else {
+                            wipe_and_remove(&trust);
+                        }
                     }
+                    Err(e) => warn!(%e, "cannot read the plaintext trust store"),
                 }
-                Err(e) => warn!(%e, "cannot read the plaintext trust store"),
             }
         }
         let attachments = attachments_dir(&dir);
@@ -515,6 +536,50 @@ mod tests {
         assert!(again.list().is_empty()); // without the secret the encrypted index stays unreadable
         let unlocker = Accounts::new(dir.clone(), Some(crypto::unlock(&dir, "pw", None).unwrap()));
         assert_eq!(unlocker.list().get("+49170").map(String::as_str), Some("acc2"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_plaintext_file_next_to_an_encrypted_one_is_not_laundered() {
+        let dir = tmp("launder");
+        let crypto = crypto::unlock(&dir, "pw", None).unwrap();
+        // A real encrypted index is created by the first, legitimate migration.
+        fs::write(dir.join("accounts.json"), br#"{"+49172":"acc1"}"#).unwrap();
+        migrate_legacy(&dir, &crypto).unwrap();
+
+        // Afterwards, a process running as the user plants a plaintext index and trust store:
+        // sealing them would overwrite the encrypted stores with attacker data (L1).
+        fs::write(dir.join("accounts.json"), br#"{"+49999":"evil"}"#).unwrap();
+        let account = dir.join("accounts").join("acc1");
+        fs::create_dir_all(&account).unwrap();
+        crypto.seal_file(crypto::purpose::TRUST, "", &account.join("trust.json.enc"), b"{}").unwrap();
+        fs::write(account.join("trust.json"), br#"{"key":"cGxhbnRlZA==","level":"TRUSTED_UNVERIFIED"}"#).unwrap();
+        migrate_legacy(&dir, &crypto).unwrap();
+
+        // The encrypted stores are unchanged; the plants are neither sealed nor read.
+        let accounts = Accounts::new(dir.clone(), Some(crypto.clone()));
+        assert_eq!(accounts.list().get("+49172").map(String::as_str), Some("acc1"));
+        assert!(accounts.list().get("+49999").is_none());
+        let enc = fs::read(dir.join("accounts.json.enc")).unwrap();
+        assert!(!enc.windows(4).any(|w| w == b"evil"));
+        assert_eq!(
+            crypto.read_encrypted(crypto::purpose::TRUST, "", &account.join("trust.json.enc")).unwrap(),
+            b"{}"
+        );
+        // Reported and left alone, not destroyed and not migrated.
+        assert!(dir.join("accounts.json").exists());
+        assert!(account.join("trust.json").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn with_a_secret_a_plaintext_index_without_an_encrypted_one_is_not_read() {
+        let dir = tmp("no-enc");
+        let crypto = crypto::unlock(&dir, "pw", None).unwrap();
+        fs::write(dir.join("accounts.json"), br#"{"+49172":"acc1"}"#).unwrap();
+        // At startup the migration seals this state; until then the plaintext file is not
+        // trusted either (L1).
+        assert!(Accounts::new(dir.clone(), Some(crypto)).list().is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
 
