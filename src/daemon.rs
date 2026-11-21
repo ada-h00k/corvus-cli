@@ -1119,11 +1119,16 @@ impl Daemon {
     /// Backstop for F1: attachments of messages that expired, were deleted or were opened
     /// view-once are removed actively (deleteAttachment RPC, remote deletes); files that no
     /// one asked for in this many days are swept at startup, so the folder cannot grow for
-    /// ever. Corvus keeps the message history — a file it still serves after the sweep
-    /// cannot be fetched again.
+    /// ever. Corvus keeps the message history — a file whose age passed the limit while its
+    /// message is still shown cannot be fetched again, so the age is configurable
+    /// (CORVUS_SWEEP_DAYS, 0 disables the sweep): Corvus sets it and owns the life cycle
+    /// through deleteAttachment; standalone use keeps the default.
     async fn sweep_old_attachments(&self) {
-        const SWEEP_AFTER_DAYS: u64 = 30;
-        let cutoff = now_ms().saturating_sub(SWEEP_AFTER_DAYS.saturating_mul(86_400_000));
+        let sweep_after_days = sweep_days();
+        if sweep_after_days == 0 {
+            return;
+        }
+        let cutoff = now_ms().saturating_sub(sweep_after_days.saturating_mul(86_400_000));
         let Ok(mut entries) = tokio::fs::read_dir(&self.attachments).await else { return };
         while let Ok(Some(entry)) = entries.next_entry().await {
             let Ok(meta) = entry.metadata().await else { continue };
@@ -1928,6 +1933,22 @@ fn downloads_automatically(sender: Uuid, self_aci: Uuid, in_group: bool, known: 
     sender == self_aci || in_group || (!hidden && known)
 }
 
+/// The attachment sweep age in days: 30 by default, overridden by CORVUS_SWEEP_DAYS. 0
+/// disables the sweep; values above ten years are clamped, a broken value keeps the default.
+fn sweep_days() -> u64 {
+    sweep_days_from(std::env::var("CORVUS_SWEEP_DAYS").ok().as_deref())
+}
+
+fn sweep_days_from(value: Option<&str>) -> u64 {
+    const DEFAULT_DAYS: u64 = 30;
+    const MAX_DAYS: u64 = 3650;
+    match value.map(str::trim).filter(|v| !v.is_empty()).and_then(|v| v.parse::<u64>().ok()) {
+        Some(0) => 0,
+        Some(days) => days.min(MAX_DAYS).max(1),
+        None => DEFAULT_DAYS,
+    }
+}
+
 /// The pointers that are downloaded automatically (F4): Signal clients send at most 32
 /// attachments per message; anything that declares more than 100 MiB is skipped, and the
 /// per-message total is capped. Pointers without a usable id are skipped (they cannot be
@@ -2463,5 +2484,19 @@ mod accepted_sender_tests {
         assert!(downloads_automatically(STRANGER, ME, true, false, true));
         // The other devices of this account are always accepted.
         assert!(downloads_automatically(ME, ME, false, false, false));
+    }
+
+    #[test]
+    fn the_sweep_age_is_configurable() {
+        // The default stays; a file Corvus still displays must not depend on a magic
+        // constant (F1 follow-up).
+        assert_eq!(sweep_days_from(None), 30);
+        assert_eq!(sweep_days_from(Some("")), 30);
+        assert_eq!(sweep_days_from(Some("nonsense")), 30);
+        assert_eq!(sweep_days_from(Some(" 14 ")), 14);
+        // 0 disables the sweep entirely; absurd ages are clamped.
+        assert_eq!(sweep_days_from(Some("0")), 0);
+        assert_eq!(sweep_days_from(Some("99999")), 3650);
+        assert_eq!(sweep_days_from(Some("-5")), 30);
     }
 }

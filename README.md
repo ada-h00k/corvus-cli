@@ -73,7 +73,10 @@ presage-store-sqlite = { path = "../presage/presage-store-sqlite" }
 
 Data is stored in `$XDG_DATA_HOME/corvus-cli` (or `$CORVUS_CLI_DIR`), with a directory
 per account. Set `CORVUS_CLI_LOG` to configure logging; `-v` and `-vv` increase
-verbosity.
+verbosity. `CORVUS_SWEEP_DAYS` sets the age in days after which attachment files that
+nothing ever asked for are swept at startup (default 30; `0` disables the sweep) — Corvus
+sets it to `0`, because it removes attachments itself with `deleteAttachment` when their
+messages are gone.
 
 ## Tests
 
