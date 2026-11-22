@@ -14,6 +14,7 @@ mod stickers;
 mod storage;
 mod store;
 mod textstyle;
+mod transfer;
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -162,6 +163,19 @@ fn main() -> ExitCode {
 
 async fn run(args: Args) -> anyhow::Result<()> {
     let dir = store::data_dir(args.config.as_deref());
+    // Make the data dir private before anything touches it: the keyring write below would
+    // otherwise create a fresh data dir with the umask's group/other bits first, and the
+    // 0700 check would then refuse data corvus-cli had just created itself (L7 — `-c ~` —
+    // is still refused before a single byte is written).
+    store::private_dir(&dir)?;
+    // Linking starts from scratch, like re-registering in the official Signal Desktop client:
+    // everything an earlier link left behind (accounts, their history and attachments, trust
+    // decisions, the keyring) is removed before the QR code appears. This runs before the
+    // data is unlocked — nothing of it is read — so `link` also works without the secret when
+    // the old data is encrypted. Corvus asks before it starts `link` on a linked device.
+    if args.command.as_deref() == Some("link") {
+        Accounts::wipe_previous_accounts(&dir)?;
+    }
     // The secret Corvus unlocked its history with (keychain entry or passphrase) also unlocks
     // the data here. It is passed in the environment instead of the command line, where other
     // users of the machine could read it; the variables are removed and their contents wiped
@@ -246,6 +260,9 @@ async fn link(accounts: &Accounts, device_name: String, crypto: Option<Crypto>) 
         async move {
             if let Ok(url) = url_rx.await {
                 // corvus reads the first stdout line starting with sgnl:// and shows it as a QR code.
+                // The capabilities parameter (transfer::with_link_capabilities) is what makes the
+                // phone offer the history transfer at all — without it the phone links silently.
+                let url = transfer::with_link_capabilities(url);
                 println!("{url}");
                 let _ = std::io::stdout().flush();
             }
@@ -267,6 +284,46 @@ async fn link(accounts: &Accounts, device_name: String, crypto: Option<Crypto>) 
     let data = manager.registration_data();
     let number = e164(&data.phone_number);
     let aci = Uuid::from(data.service_ids.aci()).to_string();
+    // While the process is still alive, offer the chat history the phone may have agreed to
+    // transfer when the QR code was scanned (Signal's "synchronized start"). Corvus reads the
+    // "history-offered" line like the sgnl:// URL and answers on stdin; without an answer
+    // (standalone use) nothing is transferred.
+    if let Some(key) = data.ephemeral_backup_key() {
+        println!("history-offered");
+        let _ = std::io::stdout().flush();
+        if transfer::read_answer().await {
+            let push = manager.identified_push_service();
+            let self_info = transfer::SelfInfo { aci: aci.clone(), number: number.clone() };
+            let staging = staging.clone();
+            let result = transfer::run(&push, &staging, key, self_info, |count| {
+                println!("history-progress {count}");
+                let _ = std::io::stdout().flush();
+            })
+            .await;
+            match result {
+                Ok(Some(count)) => println!("history-done {count}"),
+                Ok(None) => println!("history-skip"), // the phone decided against the transfer
+                Err(e) => {
+                    warn!(%e, "history transfer failed");
+                    // Linking still succeeded: Corvus links without the history.
+                    println!("history-error {}", e.to_string().lines().next().unwrap_or_default());
+                }
+            }
+            let _ = std::io::stdout().flush();
+        } else {
+            // The user declined: tell the phone to stop uploading the archive it started
+            // when it scanned the QR (the official client reports CONTINUE_WITHOUT_UPLOAD
+            // the same way). Best effort; the link itself is done either way.
+            if let Some(device_id) = data.device_id {
+                let push = manager.identified_push_service();
+                if let Err(e) = transfer::notify_no_upload(&push, device_id, data.registration_id).await {
+                    warn!(%e, "cannot tell the phone to skip the archive upload");
+                }
+            }
+            println!("history-skip");
+            let _ = std::io::stdout().flush();
+        }
+    }
     drop(manager);
     // Wait until every SQLx connection is closed before moving the account directory.
     // Windows keeps SQLite database/WAL files locked until the pool has fully shut down.

@@ -22,10 +22,22 @@ path = "src/main.rs"
 presage = { git = "https://github.com/ada-h00k/presage", rev = "6588d44696ce3efbb6a0b2a5efbe423903f4ee25", features = ["cdsi"] }
 presage-store-sqlite = { git = "https://github.com/ada-h00k/presage", rev = "6588d44696ce3efbb6a0b2a5efbe423903f4ee25", features = ["cdsi"] }
 
+# Reading the message history archive the phone offers to transfer when linking (Signal's
+# "synchronized start for linked devices"). The same libsignal tag the presage fork resolves
+# libsignal-service from, so one source is built for both. test-util only makes the generated
+# backup protobuf types public.
+libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
+libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", features = ["test-util"] }
+# The protobuf runtime the libsignal-message-backup generated types are built against.
+protobuf = "3.7.2"
+
 anyhow = "1.0"
 base64 = "0.23"
 futures = "0.3"
 mime_guess = "2.0"
+# Same major version as the reqwest libsignal-service uses, so the Method/StatusCode types
+# unify (the transfer_archive call goes through PushService::request).
+reqwest = { version = "0.13", default-features = false }
 rand = "0.9"
 serde_json = "1.0"
 # The one-time SQLCipher migration of the store (sqlcipher_export); the same sqlx that
@@ -35,6 +47,9 @@ tokio = { version = "1.48", features = ["rt", "io-std", "io-util", "sync", "time
 tracing = "0.1"
 # No default features: "ansi" (stderr is read by corvus, not a terminal) and "tracing-log" are not needed.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+# The link QR URL: the capabilities parameter (backup5 = LinkAndSync, see transfer.rs) is
+# what makes the phone offer the history transfer.
+url = "2"
 # Encryption of the data at rest (keyring, account index, trust store, SQLite store,
 # attachments), the same primitives the GUI's history-store uses: a random master key wrapped
 # with Argon2id over the secret, XChaCha20-Poly1305 for the files.
@@ -45,6 +60,13 @@ chacha20poly1305 = { version = "0.11", default-features = false, features = ["al
 [dev-dependencies]
 # only used to build envelope timestamps in tests
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# The transfer tests build a real encrypted history archive (IV || AES-CBC(gzip(frames)) || HMAC)
+# the way the phone does and run the importer over it.
+flate2 = "1"
+aes = "0.9"
+cbc = "0.2"
+hmac = "0.13"
+sha2 = "0.11"
 
 # Same patches as the presage workspace; [patch] does not propagate from dependencies.
 [patch.crates-io]
