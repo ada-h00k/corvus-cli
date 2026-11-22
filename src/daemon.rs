@@ -93,6 +93,9 @@ pub struct Daemon {
     pub(crate) manager: Mgr,
     out: mpsc::UnboundedSender<Output>,
     pub(crate) attachments: PathBuf,
+    /// The account directory: history transferred from the phone while linking is served from
+    /// here (listHistoryImport / fetchHistoryImport / clearHistoryImport).
+    account_dir: PathBuf,
     /// Present when a secret unlocked the data: attachments are written encrypted (and read
     /// encrypted, plain files of an older version still read).
     pub(crate) crypto: Option<Crypto>,
@@ -131,6 +134,10 @@ pub struct Daemon {
     /// Pointers of messages from hidden (unaccepted) senders (F4): nothing is downloaded for
     /// them automatically; Corvus calls downloadAttachment once the request is accepted.
     pending_pointers: RefCell<VecDeque<(String, AttachmentPointer, Option<String>)>>,
+    /// The transferred history's JSONL lines, read once and cached for pagination: a replay
+    /// fetches the file page by page, and re-reading (and re-scanning) the whole file per
+    /// page made large imports noticeably slower than the official client.
+    history_lines: RefCell<Option<Vec<String>>>,
 }
 
 pub(crate) enum Target {
@@ -170,6 +177,7 @@ impl Daemon {
             group_extras: Default::default(),
             storage_state: Default::default(),
             attachments,
+            account_dir: account_dir.to_path_buf(),
             crypto,
             account,
             self_aci,
@@ -188,6 +196,7 @@ impl Daemon {
             download_tx,
             download_rx: RefCell::new(Some(download_rx)),
             pending_pointers: Default::default(),
+            history_lines: Default::default(),
         });
         daemon.reload_directory().await;
         daemon.reload_groups().await;
@@ -1210,6 +1219,11 @@ impl Daemon {
             "updateProfile" => self.update_profile(p).await,
             "updateAccount" => self.update_account(p).await,
             "trust" => self.trust(p).await,
+            // Chat history transferred from the phone while linking (Signal's synchronized
+            // start): Corvus replays it into its own store and clears it afterwards.
+            "listHistoryImport" => self.list_history_import(),
+            "fetchHistoryImport" => self.fetch_history_import(p),
+            "clearHistoryImport" => self.clear_history_import(),
             other => Err(RpcError::unsupported(other)),
         }
     }
@@ -1765,21 +1779,84 @@ impl Daemon {
             return Err(RpcError::invalid("invalid attachment id"));
         }
         if !self.attachments.join(id).exists() {
-            let pointer = self
+            let from_receive = self
                 .pending_pointers
                 .borrow_mut()
                 .iter()
                 .find(|(pending, _, _)| pending == id)
                 .map(|(_, pointer, name)| (pointer.clone(), name.clone()));
-            let Some((pointer, name)) = pointer else {
-                return Err(RpcError::failed("Could not find attachment"));
+            let pointer = match from_receive {
+                Some((pointer, name)) => (pointer, name),
+                // History transferred while linking recorded its transit-tier pointers in the
+                // account directory: fetch those like live ones, too.
+                None => match self.transfer_pointer(id) {
+                    Some(pointer) => (pointer, Some(id.to_owned())),
+                    None => return Err(RpcError::failed("Could not find attachment")),
+                },
             };
+            let (pointer, name) = pointer;
             match tokio::time::timeout(DOWNLOAD_TIMEOUT, self.download(&pointer, name)).await {
                 Ok(()) => {}
                 Err(_) => return Err(RpcError::failed("download timed out")),
             }
         }
         self.get_attachment(p).await
+    }
+
+    /// The CDN pointer the history transfer recorded for an imported attachment id.
+    fn transfer_pointer(&self, id: &str) -> Option<AttachmentPointer> {
+        let index = std::fs::read(crate::transfer::attachments_file(&self.account_dir)).ok()?;
+        let index: Value = serde_json::from_slice(&index).ok()?;
+        crate::transfer::pointer_from_index(index.get(id)?)
+    }
+
+    /// Whether a chat history transfer was imported while linking (listHistoryImport).
+    fn list_history_import(&self) -> RpcResult {
+        match crate::transfer::import_available(&self.account_dir) {
+            Some(count) => Ok(json!({"available": true, "count": count})),
+            None => Ok(json!({"available": false})),
+        }
+    }
+
+    /// One page of the transferred history: envelope JSONs like live receive notifications,
+    /// paginated by line index. Served only after the import finished (meta says done). The
+    /// lines are read from disk once and cached for the rest of the replay.
+    fn fetch_history_import(&self, p: &Params) -> RpcResult {
+        if crate::transfer::import_available(&self.account_dir).is_none() {
+            return Ok(json!({"messages": [], "nextCursor": Value::Null}));
+        }
+        let mut cache = self.history_lines.borrow_mut();
+        if cache.is_none() {
+            let content = std::fs::read_to_string(crate::transfer::history_file(&self.account_dir))
+                .map_err(|e| RpcError::failed(format!("cannot read the transferred history: {e}")))?;
+            *cache = Some(content.lines().map(str::to_owned).collect());
+        }
+        let lines = cache.as_deref().unwrap_or(&[]);
+        let start = p.u64("cursor").unwrap_or(0) as usize;
+        let limit = p.u64("limit").unwrap_or(500).clamp(1, 2000) as usize;
+        let end = start.saturating_add(limit).min(lines.len());
+        let messages: Vec<Value> = lines
+            .get(start..end)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let next_cursor = if end < lines.len() { json!(end) } else { Value::Null };
+        Ok(json!({"messages": messages, "nextCursor": next_cursor}))
+    }
+
+    /// Drops the transferred history after Corvus replayed it. The attachment pointer index
+    /// stays: Corvus fetches imported attachments by id long after the replay.
+    fn clear_history_import(&self) -> RpcResult {
+        *self.history_lines.borrow_mut() = None;
+        for file in [crate::transfer::history_file(&self.account_dir), crate::transfer::meta_file(&self.account_dir)] {
+            if let Err(e) = std::fs::remove_file(&file) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(path = %file.display(), %e, "cannot remove the transferred history");
+                }
+            }
+        }
+        Ok(json!({}))
     }
 
     async fn get_avatar(&self, p: &Params) -> RpcResult {

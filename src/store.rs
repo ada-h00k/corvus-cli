@@ -42,9 +42,11 @@ fn home() -> PathBuf {
 
 /// Creates a directory readable only by the user (key material lives below it). Missing
 /// components on the way are created 0700 as well (they would otherwise carry the umask's
-/// group/other bits). A directory that already exists is not chmod-ed — `-c ~` must not
-/// change the home directory (L7) — it is only required to already be 0700, with a clear
-/// error for the user otherwise.
+/// group/other bits). A directory that already exists is tightened to 0700 only when it is
+/// the data directory itself (leaf `corvus-cli`) — its name is ours, so chmod-ing it cannot
+/// hurt a directory the user merely pointed `-c` at (L7: `-c ~` must never change the home
+/// directory, whose leaf is not named corvus-cli). Every other existing directory with
+/// looser permissions is refused with the exact fix, and left as it was.
 pub fn private_dir(path: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
@@ -63,11 +65,18 @@ pub fn private_dir(path: &Path) -> anyhow::Result<()> {
         }
         let mode = meta.permissions().mode() & 0o777;
         if mode != 0o700 {
-            bail!(
-                "{} exists with permissions {:o}; corvus-cli needs 0700 there (key material lives below; create it or fix it yourself)",
-                path.display(),
-                mode
-            );
+            if path.file_name() == Some(std::ffi::OsStr::new("corvus-cli")) {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("cannot tighten permissions on {}", path.display()))?;
+                eprintln!("note: tightened permissions on {} from {:o} to 0700", path.display(), mode);
+            } else {
+                bail!(
+                    "{} exists with permissions {:o}; corvus-cli needs 0700 there (key material lives below; fix it yourself with: chmod 700 '{}')",
+                    path.display(),
+                    mode,
+                    path.display()
+                );
+            }
         }
         return Ok(());
     }
@@ -172,6 +181,37 @@ impl Accounts {
             Some(name) => Ok(self.account_dir(&name)),
             None => bail!("User {account} is not registered."),
         }
+    }
+
+    /// Removes everything an earlier link left behind: the account directories (store,
+    /// imported history, attachments), the account index, the identity trust decisions and
+    /// the keyring. `link` runs this first, so a re-link starts fresh like re-registering in
+    /// the official Signal Desktop client. Nothing here is read, only removed: this also
+    /// works without the secret when the old data is encrypted, which makes a fresh link the
+    /// way out of a key the user no longer has. The data directory itself stays (0700).
+    pub fn wipe_previous_accounts(dir: &Path) -> anyhow::Result<()> {
+        let targets = [
+            dir.join("accounts"),
+            dir.join("accounts.json"),
+            dir.join("accounts.json.enc"),
+            dir.join("trust.json"),
+            dir.join("trust.json.enc"),
+            dir.join("keyring.enc"),
+        ];
+        for target in &targets {
+            let meta = match fs::symlink_metadata(target) {
+                Ok(meta) => meta,
+                Err(_) => continue, // nothing of that kind was ever written
+            };
+            if meta.is_dir() {
+                fs::remove_dir_all(target)
+                    .with_context(|| format!("cannot remove previous account data {}", target.display()))?;
+            } else {
+                fs::remove_file(target)
+                    .with_context(|| format!("cannot remove previous account data {}", target.display()))?;
+            }
+        }
+        Ok(())
     }
 
     /// A fresh directory for linking; it is renamed by `register` once linking succeeded.
@@ -490,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn private_dir_creates_0700_and_refuses_looser_ones() {
+    fn private_dir_creates_tightens_or_refuses() {
         let dir = tmp("private");
         // Created on demand, readable only by the user — every level of the way.
         let nested = dir.join("accounts").join("acc1");
@@ -501,18 +541,62 @@ mod tests {
             assert_eq!(fs::metadata(&nested).unwrap().permissions().mode() & 0o777, 0o700);
             assert_eq!(fs::metadata(dir.join("accounts")).unwrap().permissions().mode() & 0o777, 0o700);
         }
-        // An existing directory is not chmod-ed (`-c ~` must not change the home directory,
-        // L7): it is refused instead, and left as it was.
+        // An existing directory is tightened only when it is the data directory itself
+        // (leaf `corvus-cli`): its name is ours, so 0755 cannot be intentional.
+        let ours = dir.join("corvus-cli");
+        fs::create_dir_all(&ours).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&ours, fs::Permissions::from_mode(0o755)).unwrap();
+            private_dir(&ours).unwrap();
+            assert_eq!(fs::metadata(&ours).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        // Anything else is refused and left as it was (`-c ~` must not change the home
+        // directory, L7), with the exact fix in the message.
         let existing = dir.join("loose");
         fs::create_dir_all(&existing).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
-            assert!(private_dir(&existing).is_err());
+            let err = format!("{}", private_dir(&existing).unwrap_err());
+            assert!(err.contains("chmod 700"), "error lacks the fix: {err}");
             assert_eq!(fs::metadata(&existing).unwrap().permissions().mode() & 0o777, 0o755);
         }
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wipe_previous_accounts_removes_everything_from_an_earlier_link() {
+        let dir = tmp("wipe");
+        // What a previous link leaves behind: account directory with store, imported history
+        // and attachments, the index (plaintext and encrypted variants), trust decisions and
+        // the keyring.
+        let accounts = dir.join("accounts");
+        fs::create_dir_all(accounts.join("acc1").join("attachments")).unwrap();
+        fs::write(accounts.join("acc1").join("store.db3"), b"store").unwrap();
+        fs::write(accounts.join("acc1").join("history-import.jsonl"), b"{}\n").unwrap();
+        fs::write(accounts.join("acc1").join("attachments").join("a.bin"), b"att").unwrap();
+        fs::write(dir.join("accounts.json"), b"{}").unwrap();
+        fs::write(dir.join("accounts.json.enc"), b"enc").unwrap();
+        fs::write(dir.join("trust.json"), b"{}").unwrap();
+        fs::write(dir.join("trust.json.enc"), b"enc").unwrap();
+        fs::write(dir.join("keyring.enc"), b"keyring").unwrap();
+
+        Accounts::wipe_previous_accounts(&dir).unwrap();
+        // The data directory itself stays (linking continues there), but it is empty now.
+        assert!(dir.is_dir());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+
+        // Wiping a directory that has nothing to remove (fresh install) is fine, and so is
+        // calling it again on the now-empty directory.
+        let empty = tmp("wipe-empty");
+        Accounts::wipe_previous_accounts(&empty).unwrap();
+        Accounts::wipe_previous_accounts(&dir).unwrap();
+        assert!(empty.is_dir());
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(empty).unwrap();
     }
 
     #[test]
