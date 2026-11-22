@@ -35,6 +35,16 @@ impl<E: std::fmt::Display> From<E> for RpcError {
 
 pub type RpcResult = Result<Value, RpcError>;
 
+/// `{"data": <base64 of bytes>}`, the result of getAttachment, getAvatar and getSticker.
+/// Built as a `Value::String` directly: `json!({"data": text})` serialises its operand by
+/// reference and so copies the whole base64 text, which for a large attachment is tens of MB.
+pub fn data_result(bytes: &[u8]) -> Value {
+    use base64::prelude::{Engine as _, BASE64_STANDARD};
+    let mut result = Map::new();
+    result.insert("data".to_owned(), Value::String(BASE64_STANDARD.encode(bytes)));
+    Value::Object(result)
+}
+
 #[derive(Debug)]
 pub struct Request {
     pub id: Option<Value>,

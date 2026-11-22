@@ -421,16 +421,20 @@ async fn write_output<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    while let Some(output) = out_rx.recv().await {
-        let mut line = output.value.to_string();
+    while let Some(daemon::Output { value, written }) = out_rx.recv().await {
+        let mut line = value.to_string();
+        // A response can be tens of MB (getAttachment): free the JSON tree before the write,
+        // which waits for Corvus to read it, instead of keeping both copies until it is done.
+        drop(value);
         line.push('\n');
         let result = async {
             stdout.write_all(line.as_bytes()).await?;
             stdout.flush().await
         }
         .await;
+        drop(line);
 
-        if let Some(written) = output.written {
+        if let Some(written) = written {
             let confirmation = result.as_ref().map(|_| ()).map_err(ToString::to_string);
             let _ = written.send(confirmation);
         }

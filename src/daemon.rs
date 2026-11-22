@@ -1737,7 +1737,7 @@ impl Daemon {
             .read_stored(id)
             .await
             .map_err(|_| RpcError::failed("Could not find attachment"))?;
-        Ok(json!({"data": BASE64_STANDARD.encode(data)}))
+        Ok(rpc::data_result(&data))
     }
 
     /// Reads a file stored in the attachments dir. With a secret, stored files are frames (the
@@ -1805,7 +1805,7 @@ impl Daemon {
             return Err(RpcError::invalid("one of groupId, contact or profile is required"));
         };
         match avatar {
-            Some(data) if !data.is_empty() => Ok(json!({"data": BASE64_STANDARD.encode(data)})),
+            Some(data) if !data.is_empty() => Ok(rpc::data_result(&data)),
             _ => Err(RpcError::failed("No avatar found")),
         }
     }

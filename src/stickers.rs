@@ -5,7 +5,6 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use base64::prelude::*;
 use futures::io::AsyncReadExt;
 use presage::libsignal_service::prelude::ProtobufMessage;
 use presage::libsignal_service::proto::Pack;
@@ -163,7 +162,7 @@ impl Daemon {
             .sticker_bytes(&pack_id, sticker_id)
             .await
             .ok_or_else(|| RpcError::failed("Could not find sticker pack"))?;
-        Ok(json!({"data": BASE64_STANDARD.encode(bytes)}))
+        Ok(crate::rpc::data_result(&bytes))
     }
 
     /// The sticker of a `send` ("packId:stickerId"), with its image uploaded as Signal's clients do.
