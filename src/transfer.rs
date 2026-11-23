@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context as _};
 use base64::prelude::*;
 use libsignal_account_keys::BackupKey;
+use libsignal_core::Aci as BackupAci;
 use libsignal_message_backup::frame::{FileReaderFactory, FramesReader};
 use libsignal_message_backup::key::MessageBackupKey;
 use libsignal_message_backup::parse::VarintDelimitedReader;
@@ -245,9 +246,18 @@ async fn download_archive(push: &PushService, cdn: u32, key: &str, path: &Path) 
 /// like the official clients do for a link-and-sync transfer (libsignal's MessageBackupKey,
 /// backup id version 1, no forward-secrecy token for this purpose).
 fn message_backup_key(ephemeral_key: [u8; 32], aci: &Aci) -> MessageBackupKey {
+    // Presage still supplies the v0.99.0 Aci type, while BackupKey v0.108.3 expects
+    // libsignal-core's v0.108.3 Aci. The service ID binary representation is the same
+    // protocol-level 16-byte UUID, so bridge the Rust type boundary explicitly.
+    let backup_aci_bytes: [u8; 16] = aci
+        .service_id_binary()
+        .try_into()
+        .expect("an ACI service ID must be 16 bytes");
+    let backup_aci = BackupAci::from_uuid_bytes(backup_aci_bytes);
+
     // The ephemeral key is used as a BackupKey directly; the version is pinned by the protocol.
     let backup_key = BackupKey::<1>(ephemeral_key);
-    let backup_id = backup_key.derive_backup_id(aci);
+    let backup_id = backup_key.derive_backup_id(&backup_aci);
     MessageBackupKey::derive::<1>(&backup_key, &backup_id, None)
 }
 
