@@ -27,7 +27,7 @@ presage-store-sqlite = { git = "https://github.com/ada-h00k/presage", rev = "658
 # libsignal-service from, so one source is built for both. test-util only makes the generated
 # backup protobuf types public.
 libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0" }
-libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.99.0", features = ["test-util"] }
+libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.108.3", features = ["test-util"] }
 # The protobuf runtime the libsignal-message-backup generated types are built against.
 protobuf = "3.7.2"
 
