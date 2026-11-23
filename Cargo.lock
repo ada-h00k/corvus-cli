@@ -741,7 +741,7 @@ dependencies = [
  "flate2",
  "futures",
  "hmac 0.13.0",
- "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.99.0)",
+ "libsignal-account-keys 0.1.0 (git+https://github.com/signalapp/libsignal?tag=v0.108.3)",
  "libsignal-message-backup",
  "mime_guess",
  "presage",
