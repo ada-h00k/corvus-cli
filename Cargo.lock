@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "corvus-cli"
-version = "1.8.0"
+version = "1.8.2"
 dependencies = [
  "aes 0.9.4",
  "anyhow",
