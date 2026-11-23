@@ -23,10 +23,11 @@ presage = { git = "https://github.com/ada-h00k/presage", rev = "6588d44696ce3efb
 presage-store-sqlite = { git = "https://github.com/ada-h00k/presage", rev = "6588d44696ce3efbb6a0b2a5efbe423903f4ee25", features = ["cdsi"] }
 
 # Reading the message history archive the phone offers to transfer when linking (Signal's
-# "synchronized start for linked devices"). The same libsignal tag the presage fork resolves
-# libsignal-service from, so one source is built for both. test-util only makes the generated
-# backup protobuf types public.
+# "synchronized start for linked devices"). The backup crates share v0.108.3. Presage's
+# libsignal-service still uses v0.99.0; transfer.rs converts its Aci across that version boundary.
+# test-util only makes the generated backup protobuf types public.
 libsignal-account-keys = { git = "https://github.com/signalapp/libsignal", tag = "v0.108.3" }
+libsignal-core = { git = "https://github.com/signalapp/libsignal", tag = "v0.108.3" }
 libsignal-message-backup = { git = "https://github.com/signalapp/libsignal", tag = "v0.108.3", features = ["test-util"] }
 # The protobuf runtime the libsignal-message-backup generated types are built against.
 protobuf = "3.7.2"
