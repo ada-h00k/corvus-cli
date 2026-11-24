@@ -21,10 +21,10 @@ use presage::model::messages::Received;
 use presage::proto::data_message::{quote, Delete, Flags, Quote, Reaction, UnpinMessage, pin_message::PinDuration, PinMessage};
 use presage::proto::data_message::{contact::{Avatar as ContactAvatar, Name as ContactName, Phone as ContactPhone}, Contact, PollCreate, PollTerminate, PollVote};
 use presage::proto::receipt_message::Type as ReceiptType;
-use presage::proto::sync_message::Content as SyncContent;
+use presage::proto::sync_message::{Content as SyncContent, Read as SyncRead};
 use presage::proto::typing_message::Action;
 use presage::proto::{
-    AttachmentPointer, DataMessage, EditMessage, GroupContextV2, Preview, ReceiptMessage, TypingMessage,
+    AttachmentPointer, DataMessage, EditMessage, GroupContextV2, Preview, ReceiptMessage, SyncMessage, TypingMessage,
 };
 use presage::store::{ContentsStore, Store};
 use presage::Manager;
@@ -1200,6 +1200,7 @@ impl Daemon {
             "sendContact" => self.send_contact(p).await,
             "remoteDelete" => self.remote_delete(p).await,
             "sendReceipt" => self.send_receipt(p).await,
+            "syncReadMessages" => self.sync_read_messages(p).await,
             "sendTyping" => self.send_typing(p).await,
             "getAttachment" => self.get_attachment(p).await,
             "downloadAttachment" => self.download_attachment(p).await,
@@ -1652,6 +1653,56 @@ impl Daemon {
             other => return Err(RpcError::invalid(format!("unknown receipt type '{other}'"))),
         };
         self.queue_receipt(recipient, kind as i32, p.u64s("targetTimestamps")).await
+    }
+
+    /// Synchronizes messages read in Corvus to this account's other Signal devices.
+    /// This is separate from a ReceiptMessage sent to the author: it tells the phone that
+    /// the linked desktop has already displayed the incoming messages.
+    async fn sync_read_messages(&self, p: &Params) -> RpcResult {
+        let reads = p.0.get("reads").and_then(Value::as_array)
+            .ok_or_else(|| RpcError::invalid("missing parameter 'reads'"))?;
+        if reads.is_empty() {
+            return Ok(json!({}));
+        }
+        if reads.len() > 500 {
+            return Err(RpcError::invalid("at most 500 read sync entries may be sent at once"));
+        }
+
+        let mut sync_reads = Vec::with_capacity(reads.len());
+        for item in reads {
+            let sender = item.get("sender").and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| RpcError::invalid("each read sync entry needs a sender"))?;
+            let timestamp = item.get("timestamp").and_then(Value::as_u64)
+                .filter(|ts| *ts > 0)
+                .ok_or_else(|| RpcError::invalid("each read sync entry needs a positive timestamp"))?;
+            let sender_aci = self.resolve_aci(sender).await?;
+            sync_reads.push(SyncRead {
+                sender_aci: Some(sender_aci.to_string()),
+                timestamp: Some(timestamp),
+                ..Default::default()
+            });
+        }
+
+        let sync = SyncMessage {
+            read: sync_reads,
+            ..SyncMessage::with_padding(&mut rand::rng())
+        };
+        let timestamp = now_ms();
+        let _guard = self.send_lock.lock().await;
+        self.wait_for_outbound_slot().await?;
+        let mut manager = self.manager.clone();
+        let result = manager.send_message(
+            ServiceId::Aci(Aci::from(self.self_aci)),
+            ContentBody::SynchronizeMessage(sync),
+            timestamp,
+        ).await;
+        let error_message = result.as_ref().err().map(ToString::to_string);
+        self.record_outbound_result(error_message.as_deref());
+        result?;
+        // Presage stores sent transcripts locally; sync messages are transient as well.
+        self.purge_messages().await;
+        Ok(json!({"timestamp": timestamp, "results": []}))
     }
 
     async fn send_typing(&self, p: &Params) -> RpcResult {
